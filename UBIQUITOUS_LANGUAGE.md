@@ -106,7 +106,8 @@ to a target State. **Each Process becomes a CLI subcommand and an MCP tool.**
 
 ### ProcessName
 The CLI-friendly name of a Process. v1: hand-authored
-(`open_direct_inbox`, `send_dm`). v2: LLM-suggested with human approval.
+(`open_direct_inbox`, `send_dm`, `view_profile`, `list_recent_posts`).
+v2: LLM-suggested with human approval.
 
 ### SiteGraph
 The full model of a site. One per `Domain`. Persisted as a single
@@ -237,14 +238,47 @@ on success **writes back** the updated `Action[]` into the StateActionCache.
 
 ### StateActionCache
 The novel cache. Keyed by `(state_id, atom_id)` instead of Stagehand's
-`(instruction, url)`. Two different instructions sharing the same
+`(instruction, url)`. Two different Processes whose paths share the same
 `(from_state → atom → to_state)` triple share one cache entry — this is
 **the central composability win** vs Stagehand's per-task ActCache.
+
+**Important: the key is structural, not semantic.** No embedding, no LLM
+similarity, no synonym detection. Different Processes hit the same cache
+entry because their *graph paths overlap*, not because their *names mean
+similar things*. See "CrossProcessEdgeReuse" below.
 
 ### AtomId
 SHA-256 of `(role, accessible_name, xpath_shape)` where `xpath_shape` is
 the XPath template (drop indices, keep tags). Disambiguates "like button on
 home" from "like button in reels modal."
+
+### CrossProcessEdgeReuse
+The phenomenon that makes `StateActionCache` valuable: when two named
+Processes traverse the same graph edge (same `from_state` and same
+`atom_id`), they share one cache entry.
+
+**Worked example.** Process `open_inbox` has 1 edge:
+`home → inbox_btn → inbox_state`. Process `send_dm_to_alice` has 4 edges,
+the first of which is also `home → inbox_btn → inbox_state`. The first
+time either Process runs, the LLM resolves the edge once. Every subsequent
+run of *either* Process — regardless of name, args, or surrounding context
+— hits the cache for that edge.
+
+This is the architectural delta vs Stagehand. Stagehand's `ActCache` keys
+by `(instruction, url)` — the literal phrasing. Two different Processes
+that happen to traverse the same edge can never share a cache entry there.
+We can.
+
+> **Out of scope:** "user types `go to my dms` and the system figures out
+> they meant `open_inbox`" is *not* what CrossProcessEdgeReuse means. That's
+> ProcessResolver — a separate, optional v2 concept.
+
+### ProcessResolver (v2 only)
+A *future* layer above the cache that maps free-form natural-language user
+requests onto known `ProcessName`s using embeddings or LLM matching.
+**Not v1.** Process selection in v1 is by exact name. ProcessResolver is
+optional sugar that would re-introduce per-instruction LLM cost; only build
+it if there's a concrete reason callers can't pass process names directly.
 
 ### ValidationHash
 Hash of the expected `to_state.atoms` for an Operation. After replay we
@@ -318,6 +352,146 @@ the graph (highlight active edge per step).
 
 ---
 
+## Campaigns (the workflow layer)
+
+The campaigns package is platform-agnostic — it works on top of any per-site
+CLI/MCP that emitters produce. Vocabulary scoped to bulk-workflow operations
+(outbound, lead enrichment, recruiting, content research, competitive
+intel).
+
+### Campaign
+A named bulk workflow with a `CampaignConfig`, output artifacts under
+`~/.cartographer/campaigns/<name>/`, and a three-phase lifecycle
+(Build → Review → Send). Each Campaign targets exactly one indexed site
+(or one logical surface — e.g. "instagram-coaches", "linkedin-fitness").
+
+### CampaignConfig
+The user-authored YAML / JSON describing the Campaign:
+- `seed` — where prospects come from (hashtag, search query, manual list,
+  CSV import, audience-overlap export)
+- `filter` — qualification thresholds (`max_followers`, `bio_keywords`,
+  `must_have_pinned`, etc.)
+- `qualify_prompt` — LLM prompt that produces the `Qualification` per
+  prospect
+- `draft_prompt` — LLM prompt that produces the `DraftDm` per qualified
+  prospect
+- `send_caps` — `{ max_per_day, jitter_minutes, account_id }`
+- `evidence_capture` — whether to save screenshots per prospect
+
+### CampaignDir
+The on-disk artifact directory: `~/.cartographer/campaigns/<name>/` with
+`config.yaml`, `prospects.jsonl`, `approved.jsonl`, `rejected.jsonl`,
+`sent.jsonl`, `notes/`. Treated as the canonical source of truth for the
+campaign's state — resumable, auditable, version-controllable.
+
+### Phase 1 / Build
+The proactive discovery + qualification + drafting phase. Drives the
+emitted per-site MCP tools to navigate, extract structured data, qualify
+prospects against the `CampaignConfig.filter`, and draft DMs.
+**Risk: LOW** — reads only, no writes to the platform. Throttle is light
+(Cartographer's standard 1–3s).
+
+### Phase 2 / Review
+The human-in-the-loop approval phase. No platform interaction — purely
+local. The reviewer goes through `prospects.jsonl` entries in a TUI/web UI
+and emits `approved.jsonl` (with optional edits) or `rejected.jsonl`.
+**Risk: NONE.**
+
+### Phase 3 / Send
+The paced sending phase. Loads `approved.jsonl`, sends one DM at a time
+using the per-site MCP `send_dm` tool, with randomized inter-send delay
+(see `Jitter`) and a hard daily cap (see `SendCap`).
+**Risk: HIGH** — write activity, bot-detection-flagged. Caps and jitter
+are the defense.
+
+### Prospect
+A candidate identified during Phase 1:
+```
+{
+  handle, qualified_at,
+  profile: ProfileSummary,
+  qualification: { is_fit, creator_type, services_offered,
+                   strongest_signal, personalization_hooks },
+  draft_dm: string
+}
+```
+Lives one-per-line in `prospects.jsonl`. Append-only during Phase 1.
+
+### ApprovedProspect
+A `Prospect` that passed human review, with optional edits to `draft_dm`:
+```
+{
+  handle, approved_at, approved_by,
+  prospect: Prospect,
+  edits: { draft_dm?: string },           // null if no edits
+  scheduled_for?: ISO8601                  // optional manual scheduling
+}
+```
+Lives one-per-line in `approved.jsonl`.
+
+### RejectedProspect
+A `Prospect` explicitly rejected during review:
+```
+{ handle, rejected_at, rejected_by, reason: string }
+```
+Lives one-per-line in `rejected.jsonl`. **Never re-shown** in subsequent
+reviews of the same campaign.
+
+### SentRecord
+The audit log entry for one DM dispatch:
+```
+{
+  handle, sent_at, account_id,
+  message_actually_sent: string,
+  send_result: { success, platform_response?, error? },
+  duration_ms
+}
+```
+Lives one-per-line in `sent.jsonl`. Source of truth for "was it sent?"
+when resuming a paused campaign.
+
+### SendCap
+The hard daily limit on Phase 3 sends, per `(campaign, account_id)`. Default
+≤10/day for outbound. Configurable per `CampaignConfig.send_caps.max_per_day`.
+Cap is enforced at the campaign level — even if you ran `send` twice in a
+day, you don't exceed it.
+
+### Jitter
+Randomized inter-send delay drawn from a configured range. Default 30–90
+minutes for outbound DMs. Configurable per `CampaignConfig.send_caps.jitter_minutes`.
+Anti-detection: regular intervals are easier to flag than randomized ones.
+
+### Qualification
+The LLM-produced structured judgment of a prospect:
+```
+{
+  is_fit: boolean,
+  creator_type: string,
+  services_offered: string[],
+  strongest_signal: string,
+  personalization_hooks: string[]
+}
+```
+Output of `CampaignConfig.qualify_prompt` evaluated against the prospect's
+`profile + pinned posts + recent posts`.
+
+### DraftDm
+The LLM-produced personalized message for a qualified prospect.
+String, conversational, ≤280 chars in the default config, references at
+least one of `Qualification.personalization_hooks`.
+
+### EvidenceCapture
+Per-prospect screenshots + atom snapshots saved to
+`<campaign-dir>/notes/<handle>/` during Phase 1. Useful for review and
+audit. Optional via `CampaignConfig.evidence_capture`.
+
+### CampaignStatus
+A computed view: `{ phase: 'building'|'review'|'sending'|'paused'|'done',
+counts: {...}, last_action_at, sends_today, sends_this_run }`.
+Surfaced via `cartographer-campaign status <name>`.
+
+---
+
 ## Algorithms
 
 ### Frontier (BFS)
@@ -377,26 +551,36 @@ Prevents the planner from re-trying paths it just learned don't work.
 | "Element" | Conflates with DOM. Use `Atom`. |
 | "Page" alone | Ambiguous (URL? logical screen?). Use `State` + `kind`. |
 | "Action" alone (in Cartographer-only docs) | Stagehand's substrate term; in graph context use `Operation`. In Stagehand-bridge code, `Action` is fine. |
-| "Workflow" | Skyvern's term. Use `Process`. |
+| "Workflow" | Skyvern's term. Use `Process` for graph-level journey, `Campaign` for cross-site bulk operations. |
 | "Skill" alone | Anthropic-overloaded. Use `Process` for executable, `skill.md` for the doc. |
 | "Crawl" | Implies SEO-style URL discovery. Use `explore` because we discover atoms and transitions, not URLs. |
 | "Map" alone | Ambiguous. Be specific: `SiteGraph`, `MapRecorder`, `cartography prompt`. |
 | "Site" alone | Use `Domain` for the identifier, `SiteGraph` for the model. |
 | "Robot" / "bot" | Carries automation-evasion connotations we don't want. We're a cartographer. |
+| "Cross-instruction cache reuse" | Misleading — implies cache hits depend on phrasing similarity. Use `CrossProcessEdgeReuse`. |
+| "Semantic cache" | Our cache is structural, not semantic. Don't suggest otherwise. |
+| "Cold contact" / "spam" | Use `Prospect` and `Campaign`. We're describing platform-neutral bulk workflows. |
+| "Drip" | Overloaded marketing term. Use `Phase 3` or `paced send`. |
+| "Funnel" | Overloaded. Be specific about which phase. |
 
 ---
 
 ## Naming conventions
 
-- Types are `PascalCase`: `State`, `Operation`, `SiteGraph`.
-- IDs are `<Type>Id`: `StateId`, `OpId`, `AtomId`.
-- Function names are `camelCase` and verb-led: `canonicalizeAtoms`, `planPath`.
+- Types are `PascalCase`: `State`, `Operation`, `SiteGraph`, `Campaign`,
+  `Prospect`, `ApprovedProspect`.
+- IDs are `<Type>Id`: `StateId`, `OpId`, `AtomId`, `CampaignId`.
+- Function names are `camelCase` and verb-led: `canonicalizeAtoms`, `planPath`,
+  `runCampaign`, `pacedSend`.
 - File names are `kebab-case`: `canonicalize.ts`, `plan-path.ts`,
-  `state-action-cache.ts`.
+  `state-action-cache.ts`, `campaign-config.ts`.
 - Module folders are nouns: `cartographer/`, `runtime-graph/`, `emitters/`,
-  `viewer/`.
+  `viewer/`, `campaigns/`.
 - Cartographer CLI subcommands are `kebab-case`: `cartographer teach`,
   `cartographer name-process`, `cartographer status`, `cartographer emit-cli`.
+- Campaign CLI subcommands are `kebab-case`: `cartographer-campaign new`,
+  `cartographer-campaign build`, `cartographer-campaign review`,
+  `cartographer-campaign send`, `cartographer-campaign status`.
 - Emitted per-site CLIs are named `<domain>-cli`:
   `instagram-com-cli`, `github-cli`. Domain dots become hyphens.
 
@@ -420,3 +604,28 @@ When language changes, record the rationale here.
   (matches GitNexus naming, avoids Anthropic skill-as-thread overload).
 - Cartographer is a *cartographer*, not an *agent*. Reasoning is pluggable
   via `Policy`; the cartographer keeps execution authority.
+
+### 2026-05-01 (later) — Cache clarification + Campaigns vocabulary
+
+- **Renamed "cross-instruction cache reuse" → `CrossProcessEdgeReuse`.**
+  The original phrasing was misleading: it suggested two different user
+  *phrasings* could hit the same cache entry (semantic matching), which is
+  not what the cache does. The cache is structural — keyed by `(state_id,
+  atom_id)`. Two *Processes* (graph paths) sharing an edge benefit; two
+  free-form phrasings of the same intent do not, unless explicitly mapped
+  to the same `ProcessName`.
+- Added explicit `ProcessResolver` term as v2-only future work, separated
+  from the cache layer to keep the architecture clean.
+- Added "Campaigns" section as the workflow layer above per-site emitters.
+  The campaigns package is platform-agnostic and turns "indexed graph"
+  into "actionable bulk workflow." Vocabulary added: `Campaign`,
+  `CampaignConfig`, `CampaignDir`, `Phase 1/2/3`, `Prospect`,
+  `ApprovedProspect`, `RejectedProspect`, `SentRecord`, `SendCap`, `Jitter`,
+  `Qualification`, `DraftDm`, `EvidenceCapture`, `CampaignStatus`.
+- Added "Build / Review / Send" three-phase pipeline as the canonical
+  shape for any bulk-workflow campaign. Each phase has its own risk
+  profile; **discovery (Phase 1) and sending (Phase 3) are explicitly
+  decoupled** so they can be tuned independently.
+- Out-of-scope additions: "Cross-instruction cache reuse", "Semantic
+  cache", "Cold contact", "spam", "Drip", "Funnel" — clarifying
+  vocabulary boundaries.
