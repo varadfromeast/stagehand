@@ -6,35 +6,40 @@ This is a fork of [`browserbase/stagehand`](https://github.com/browserbase/stage
 created on 2026-05-01 to host the **Cartographer** project.
 
 Cartographer is the successor to `siteforge` (now abandoned). The siteforge
-experiment validated that an agent's per-site navigation cost can be cached
-into a state-graph and replayed deterministically — but it tried to rebuild
-Stagehand's substrate from scratch (atom extraction, XPath resolution,
+experiment validated the core thesis — an agent's per-site navigation cost can
+be cached into a state-graph and replayed deterministically — but tried to
+rebuild Stagehand's substrate from scratch (atom extraction, XPath resolution,
 self-healing replay, etc.). That was the wrong layer. **Stagehand has already
 shipped 60–70% of what siteforge was rebuilding.** This fork is the pivot:
-build the graph + emitter layer on top of Stagehand instead of replacing it.
+build the graph + emitter + workflow layer on top of Stagehand instead of
+replacing it.
 
 The arc is:
 
 ```
 fork upstream stagehand
     ↓
-add 4 new packages alongside packages/core
+add 5 new packages alongside packages/core
     ↓
 state identity layer over Stagehand snapshots
     ↓
-state-keyed cache (cross-instruction reuse — Stagehand's blind spot)
+state-keyed cache (cross-process edge reuse — Stagehand's blind spot)
     ↓
 proactive cartographer (active exploration, safety-gated)
     ↓
 path planner + runtime (replay paths through Stagehand)
     ↓
-emit per-site CLI + MCP + 2D viewer (3D toggle later)
+emit per-site CLI + MCP + 2D viewer
     ↓
-agents browse known sites by traversing cached graphs
+campaigns package (build → review → send pipeline)
+    ↓
+agents browse known sites → build qualified lists → send carefully
 ```
 
-End goal: **make navigating known websites for agents as cheap as querying a
-GitNexus-indexed codebase.**
+**End goal:** make navigating known sites for agents as cheap as querying a
+GitNexus-indexed codebase, **and** turn that into actionable bulk-workflow
+tooling (lead lists, outbound campaigns, research artifacts, recruiting,
+competitive intel) where one indexed site benefits every workflow built on it.
 
 ## Why fork instead of build a separate package?
 
@@ -62,6 +67,7 @@ stagehand/
     runtime-graph/    ← NEW — state-keyed cache + planner + replayer
     emitters/         ← NEW — CLI + MCP generators
     viewer/           ← NEW — 2D graph UI (3D toggle planned)
+    campaigns/        ← NEW — platform-agnostic build / review / send pipeline
 ```
 
 Each new package depends on `@browserbasehq/stagehand` like any external
@@ -95,11 +101,15 @@ After deep-reading `lib/v3/`:
 ## What Stagehand Does NOT Do (the gap = our novelty)
 
 Stagehand's `ActCache` and `AgentCache` are both keyed by
-`sha256(instruction, url, options, configSig, variableKeys)`. That means:
+`sha256(instruction, url, options, configSig, variableKeys)` — the natural-
+language instruction string is part of the cache key. That means:
 
-1. **No cross-instruction cache reuse.** `act("open inbox")` and
-   `act("go to messages")` get separate cache entries even if the underlying
-   click sequence is identical.
+1. **No cross-process edge reuse.** Two named Processes that traverse the
+   same `(from_state → atom → to_state)` edge cannot share a cache entry,
+   because Stagehand keys by the literal instruction wording. Cartographer's
+   `StateActionCache` keys by `(state_id, atom_id)` — pure graph position —
+   so any Process passing through that edge benefits, regardless of how the
+   user phrased the request.
 2. **No graph / state model.** No "I'm in state X, here are the available
    transitions." Just opaque cache entries hashed by inputs.
 3. **No proactive exploration.** Cache is populated reactively; first run of
@@ -110,8 +120,52 @@ Stagehand's `ActCache` and `AgentCache` are both keyed by
    no MCP server *generated* from the cache.
 6. **No site-level drift signal.** Self-heal happens per-edge but isn't
    aggregated into "this site changed, time to re-explore."
+7. **No campaign tooling.** No list-building, no human-review queue, no
+   paced send loop. Stagehand stops at "execute one task." Real bulk
+   workflows (outbound, enrichment, research) need the workflow layer above.
 
 These are exactly the layers Cartographer adds.
+
+## Cache Semantics — Be Precise
+
+The `StateActionCache` is **structural, not semantic**. The cache key is
+`(state_id, atom_id)` — a pure function of graph position. The natural-
+language instruction never enters the cache key. There is no embedding, no
+LLM similarity check, no synonym detection.
+
+**Worked example.** After Cartographer indexes Instagram, two Processes:
+
+```
+Process "open_inbox"
+  edges: [home_state → inbox_btn → inbox_state]
+
+Process "send_dm_to_alice"
+  edges: [home_state → inbox_btn → inbox_state,
+          inbox_state → alice_thread_btn → thread_state,
+          thread_state → message_textbox → thread_filled,
+          thread_filled → send_btn → thread_sent]
+```
+
+First call: `cartographer.run("open_inbox")`
+- Compute current state_id = sha256(canonicalized atoms) → "home_state".
+- Look up `(home_state, inbox_btn_atom_id)` in StateActionCache → **MISS**.
+- Fall back: `stagehand.act("click the inbox button")` resolves the selector
+  via LLM, executes via `takeDeterministicAction`.
+- Write result to cache: `(home_state, inbox_btn_atom_id) → cached Action[]`.
+
+Second call: `cartographer.run("send_dm_to_alice")`
+- Compute current state_id → "home_state" (back at home).
+- First edge: look up `(home_state, inbox_btn_atom_id)` → **HIT**.
+- Replay cached Action via `takeDeterministicAction`. **No LLM call.**
+- Subsequent edges resolve the same way (hit if seen, miss if new).
+
+The reuse is between **Processes**, not between phrasings. Two completely
+different goals (`open_inbox` and `send_dm_to_alice`) share the same first
+edge by graph structure, not by linguistic similarity.
+
+If a future use case requires "user types free-form, system finds the right
+process," that's a separate **Process Resolver** layer above the cache —
+optional, deferred to v2. The cache itself stays structural.
 
 ## Workstreams
 
@@ -131,7 +185,7 @@ hook (per-site predicates), `hashAtomSet()` (sha256).
 and `hash.ts` ports directly.
 
 **Risk:** State hash stability across sessions is the load-bearing assumption.
-**Mitigation: build the cross-session-stability test FIRST (week 1 spike).**
+**Mitigation: build the cross-session-stability test FIRST (Spike 1).**
 
 ### B — State-Keyed Cache (the actual novelty)
 
@@ -146,9 +200,9 @@ shape (read/write JSON, self-heal write-back, variables).
 keying. Self-heal falls back to `Stagehand.act(atom.description)` and writes
 back the new actions.
 
-**Why this is the win:** Two different user instructions sharing the same
-underlying state→atom→state transition share one cache entry. Stagehand
-cannot do this today.
+**Why this is the win:** structural key → cross-process edge reuse. Stagehand
+cannot do this today (instruction-keyed). See "Cache Semantics" above for
+worked example.
 
 **Doability: HIGH.** ~400–600 LOC. Mirrors `ActCache.ts` (387 LOC) with
 different keying.
@@ -189,7 +243,7 @@ BFS over the graph for shortest path; replay edges via
 `takeDeterministicAction`; self-heal via `act()` with write-back.
 
 **Stagehand provides:** `ActHandler.takeDeterministicAction(action, page, ...)`
-is the public-ish "execute without LLM" API. Confirm via week-1 spike #2.
+is the public-ish "execute without LLM" API. Confirm via Spike 2.
 
 **You build:** `planPath(graph, from, to)` (BFS — siteforge's `core/plan-path.ts`
 ports as-is), `replayEdge(operation)` wrapping `takeDeterministicAction`,
@@ -267,6 +321,99 @@ GitNexus uses **Sigma.js + Graphology** (also 2D). Their stack is a fine
 reference; we use `react-force-graph-2d` because it's friendlier for our
 size and gives a free 3D upgrade path.
 
+### I — Campaigns Package (the workflow layer)
+
+Platform-agnostic list-building + human-review + paced-send pipeline. Sits
+ON TOP of the per-site CLI/MCP that emitters produce. Turns "indexed graph"
+into "actionable bulk workflow." This is what makes Cartographer a product
+rather than plumbing.
+
+Three phases, each with its own risk profile:
+
+| Phase | Activity | Platform risk | Throttle |
+|---|---|---|---|
+| 1: Build | hashtag walks, profile views, post reads, LLM reasoning, draft DMs | LOW (reads only) | Light: 1–3s between actions |
+| 2: Review | none — local file inspection by human | NONE | n/a |
+| 3: Send | DMs / outbound writes | HIGH | Heavy: ≤5–10/day, randomized 30–90m delays |
+
+**Critical insight: discovery (Phase 1) and sending (Phase 3) are completely
+uncoupled.** Phase 1 can run at full Cartographer speed against 500
+candidates in a single day. Phase 3 sends 10/day for weeks afterward. This
+is the right pattern for outbound, lead enrichment, competitive intel,
+recruiting — any site-based bulk task.
+
+**Stagehand provides:** nothing specific. Sits on top of cartographer + emitters.
+
+**You build:**
+- CLI subcommands: `cartographer-campaign new/build/review/send/status`
+- File schemas under `~/.cartographer/campaigns/<name>/`:
+  - `config.yaml` — seed source, filters, qualify prompt, draft prompt,
+    safety caps
+  - `prospects.jsonl` — Phase 1 output, one Prospect per line
+  - `approved.jsonl` — Phase 2 output, ApprovedProspect with optional edits
+  - `rejected.jsonl` — explicit rejections, never re-shown
+  - `sent.jsonl` — Phase 3 audit log, one SentRecord per line
+  - `notes/` — per-prospect screenshots from cartographer evidence
+- Resumable build loop with progressive jsonl writes (kill mid-run, restart picks up)
+- Human-review interface (TUI v1, web UI v1.5) with approve/edit/reject
+- Paced sender with daily caps, randomized jitter, account isolation, audit log
+- Multi-account support (run different campaigns from different sessions)
+
+**Doability: HIGH.** ~600–1000 LOC for the package. Build loop ~150 LOC,
+review TUI ~200, sender ~150, schemas + glue ~300.
+
+**Risk:** None within Cartographer code. Platform-risk lives in the
+*deployment* of Phase 3 — daily caps and human review handle it. The tooling
+itself is straightforward jsonl + scheduling.
+
+**Why include in v1:** without campaigns, Cartographer is a navigation cache
+with no user-facing payoff. With campaigns, Cartographer is a tool the user
+can run an outbound campaign on tonight. The campaigns package is the
+delta between "neat infrastructure" and "real product."
+
+**Generalization beyond outbound:**
+- Lead enrichment (visit company pages, extract employees, push to CRM)
+- Competitive intel (weekly product page scrapes, change reports)
+- Content research (hashtag walks, trending post lists)
+- Recruiting outreach (candidate profile review, drafted messages)
+- All share the build/review/send shape; campaigns serves them all.
+
+## Canonical Use Case (anchors design conversations)
+
+To anchor design discussions, the user's stated business workflow is:
+
+> A marketing-agency outbound pipeline targeting fitness creators on Instagram
+> (and eventually LinkedIn) who are below 50K followers and offering 1:1
+> coaching services. The agent qualifies each prospect by reading pinned
+> posts + 15 recent posts, drafts a personalized DM referencing specific
+> content, queues to a list for human review, then sends approved DMs at
+> 5–10/day with randomized delays.
+
+Pipeline:
+1. **Discover candidates** via hashtag/explore walks (Phase 1, full speed)
+2. **Per candidate**: view profile, check_pinned_posts, list_recent_posts,
+   LLM reasons "is this a fit?"
+3. **For each fit**: LLM drafts personalized DM, append to `prospects.jsonl`
+4. **Human reviews** the list, approves selections (Phase 2)
+5. **Paced sender** emits ≤10 DMs/day with 30–90m randomized delays (Phase 3)
+
+This generalizes beyond IG to LinkedIn, Twitter/X, Reddit, custom CRMs,
+recruiting platforms, content research workflows — same shape, different
+indexed graph.
+
+**Optimization metric** (per-prospect cost):
+- Without Cartographer + campaigns: ~5 LLM calls × $0.10 + ~3 min navigation
+  = $0.50 / prospect
+- With: ~2 LLM calls (analysis + DM gen) × $0.10 + ~45s cached navigation
+  = $0.20 / prospect
+- **4× faster, 2.5× cheaper** at 100/day. Bigger gains as N scales (cache
+  amortizes; LLM cost stays per-prospect).
+
+This is the workflow Cartographer is designed to optimize end-to-end. Every
+architectural decision — structural cache key, named processes, hand-curated
+process names, paced send caps — feeds back to making this workflow faster,
+safer, and more leveraged.
+
 ## What NOT to Do
 
 - ❌ Reimplement Stagehand's atom extractor / XPath resolver / a11y handling.
@@ -281,6 +428,12 @@ size and gives a free 3D upgrade path.
 - ❌ Build a graph DB. JSON files. Move to SQLite if a graph exceeds ~5k
   states.
 - ❌ Modify `packages/core/`. All work lives in new packages.
+- ❌ Add semantic process resolution to the cache. The cache stays structural;
+  a Process Resolver above the cache is optional v2 work.
+- ❌ Conflate Phase 1 (discovery, low risk) with Phase 3 (send, high risk).
+  Tune them independently.
+- ❌ Skip the human-review step (Phase 2). Even with great LLM drafts, the
+  review queue is the line between "useful tool" and "spam cannon."
 
 ## Spikes to Run Before Committing 6+ Weeks
 
@@ -334,11 +487,19 @@ miss), but still works. Plan adjusts: runtime always pays LLM cost on
 | 5 | C — Cartographer Phase 1 | 7–10 days | Replace the hand-authored graph with explored output. |
 | 6 | H — 2D Viewer | 5–7 days | Visualize what you've built. |
 | 7 | G — Drift Signal | 2–3 days | Subscribe to FlowLogger; aggregate. |
-| 8 | F — MCP Emitter | 3–5 days | Last; CLI works first. |
-| 9 | C Phase 2/3 — Prompt + LLM Policy | 2–3 weeks | Optional. |
-| 10 | H 3D toggle | 3–5 days | Optional, after 2D is useful. |
+| 8 | F — MCP Emitter | 3–5 days | CLI works first; MCP is shape-variant. |
+| **9** | **I — Campaigns Package** | **5–7 days** | **The user-facing payoff. Without this, Cartographer is plumbing. Validates the whole stack against the canonical use case.** |
+| 10 | C Phase 2/3 — Prompt + LLM Policy | 2–3 weeks | Optional. |
+| 11 | H 3D toggle | 3–5 days | Optional, after 2D is useful. |
 
-**Total minimum-viable v1: ~6–8 weeks.**
+**Total minimum-viable v1: ~7–9 weeks** to "indexed IG with working CLI +
+2D viewer + drift detection + campaigns package running a real end-to-end
+prospect pipeline."
+
+A focused 12-hour MVP can deliver workstreams A, B, D narrow, E narrow with
+a hand-authored 2-state graph as a tracer-bullet — proves the architecture.
+Cartographer (C), Viewer (H), Drift (G), MCP (F), Campaigns (I) are
+multi-day to multi-week each beyond that.
 
 ## Day 1 Setup (literal commands)
 
@@ -371,10 +532,22 @@ name). Reasons:
 The CLI binary, when emitted, is named per site:
 `~/.cartographer/bin/<domain>-cli`.
 
+The campaigns package is named **stagehand-cartographer-campaigns** (or
+`@cartographer/campaigns`). Platform-agnostic — works on top of any
+indexed site.
+
+Campaign artifacts live under `~/.cartographer/campaigns/<campaign-name>/`.
+
 ## What Was Built (so far in this fork)
 
-Nothing. Just the fork itself and these handoff docs. Day 1 work is the
-spikes + package skeleton.
+- ✅ Fork created at `varadfromeast/stagehand`, default branch `main`
+- ✅ `agent-handoff.md` v2 (this file) committed — adds Workstream I
+  (campaigns), cache semantics clarification, canonical use case anchor
+- ✅ `UBIQUITOUS_LANGUAGE.md` v2 committed — adds campaigns vocabulary,
+  cache clarification
+- ⏳ Spikes 1 + 2 not yet run
+- ⏳ No `packages/cartographer/` skeleton yet
+- ⏳ No code
 
 ## References
 
@@ -386,17 +559,6 @@ spikes + package skeleton.
 - GitNexus (the inspiration for the graph + emitter pattern):
   https://github.com/abhigyanpatwari/GitNexus
 
-## Verification Status
-
-At handoff time, the following are true:
-
-- ✅ Fork created at `varadfromeast/stagehand`, default branch `main`
-- ✅ `agent-handoff.md` (this file) committed
-- ✅ `UBIQUITOUS_LANGUAGE.md` committed
-- ⏳ Spikes 1 + 2 not yet run
-- ⏳ No `packages/cartographer/` skeleton yet
-- ⏳ No code
-
 ## Caution
 
 - Cartographer drives a real browser against real sites. **Do not run
@@ -405,6 +567,14 @@ At handoff time, the following are true:
   gate is the first line of defense, not the last.
 - Anti-bot detection is real. Throttle (min 1s, jitter to 3s). Use existing
   user sessions instead of fresh logins where possible.
+- **Phase 3 (sending) is the only high-risk phase** of the campaigns
+  workflow. Phase 1 (discovery) and Phase 2 (review) carry minimal platform
+  risk. Tune their pacing independently — full speed on Phase 1, hard caps
+  on Phase 3.
+- Bulk DM workflows on Instagram violate ToS in many cases. The tool is
+  platform-neutral; use it where outbound is legitimate (LinkedIn Sales
+  Navigator workflows, recruiting on opt-in platforms, your own CRM lists).
+  We are not the layer that makes a non-compliant campaign compliant.
 - We are using a fork. Upstream Stagehand changes fast. Pull weekly:
   `git fetch upstream && git rebase upstream/main` (or merge if rebase
   conflicts get hairy).
