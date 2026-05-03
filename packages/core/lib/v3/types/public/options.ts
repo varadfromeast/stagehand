@@ -50,6 +50,17 @@ export interface V3Options {
   experimental?: boolean;
   verbose?: 0 | 1 | 2;
   selfHeal?: boolean;
+  /**
+   * Skip LLM client initialization. When true, methods that require LLM
+   * (`act(string)`, `observe()`, `agent()`, self-heal) throw a clear error
+   * if invoked. Pure deterministic replay (`act(Action)` with `selfHeal:false`)
+   * works without an API key configured.
+   *
+   * Use case: harnesses that drive the browser via cached `Action` objects
+   * and never need on-the-fly LLM resolution. Lets the harness avoid
+   * declaring an API key it would never use.
+   */
+  noLlm?: boolean;
   // V2 compatibility fields - only included because the server imports this type and supports V2
   waitForCaptchaSolves?: boolean;
   actTimeoutMs?: number;
