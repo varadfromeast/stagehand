@@ -70,6 +70,49 @@ delegated Explore search/click-profile test was interrupted before final
 assessment, so only the promoted `open_explore` skill should be treated as
 validated state from that run.
 
+### noLlm patch is applied (zero API key required for runtime)
+
+Stagehand was patched fork-locally to support `noLlm: true`, which skips
+LLM client construction entirely. Cartographer's `BrowserSession` now
+constructs Stagehand with `selfHeal: false` and `noLlm: true`, so the
+runtime hot path (`act(Action)` deterministic replay) requires no
+`OPENAI_API_KEY` or any other provider credentials.
+
+Patch is split across three commits and one applier script:
+
+- `packages/core/lib/v3/types/public/options.ts` — adds `noLlm?: boolean`
+  field to `V3Options`.
+- `packages/cartographer/src/browser-session.ts` — passes `noLlm: true`
+  to the Stagehand constructor.
+- `apply-nollm-patch.mjs` (repo root) — idempotent script that applies
+  the 4 hunks to `packages/core/lib/v3/v3.ts`. Run once after pulling.
+
+To bring a fresh checkout to the current state:
+
+```bash
+git pull origin main
+node apply-nollm-patch.mjs        # applies 4 hunks to v3.ts; safe to re-run
+pnpm install
+pnpm --filter @browserbasehq/stagehand build
+pnpm --filter @cartographer/core build
+git add packages/core/lib/v3/v3.ts
+git commit -m "feat(v3): apply noLlm patch via apply-nollm-patch.mjs"
+git push
+```
+
+### Live smoke verified (2026-05-03)
+
+Most recent live smoke for `open-inbox` returned `success: true`,
+`postconditions.passed: true`, `drift.detected: false`, with no API key in
+the environment. Init log confirmed
+`noLlm:true — LLM-dependent methods will throw if invoked. Deterministic act(Action) replay works.`
+Both steps logged `cacheHit: true, actionCount: 1` — pure deterministic
+replay through Stagehand's `takeDeterministicAction`.
+
+Login persistence via `userDataDir + preserveUserDataDir: true` is
+confirmed working — the inbox URL resolved without a redirect to
+`/accounts/login/`.
+
 Current lifecycle support:
 
 ```text
@@ -433,62 +476,135 @@ Main interfaces:
 
 ## Stagehand Boundary
 
-Known skills store and replay Stagehand-shaped `Action[]`.
-`BrowserSession.actRaw(action)` delegates to Stagehand `act(Action)`.
+Cartographer uses Stagehand in a deliberately narrow mode: `noLlm: true`
+and `selfHeal: false`. The runtime hot path makes zero LLM calls and
+requires zero API keys.
 
-Stagehand cache is instruction-based. Cartographer cache is structural:
+Stagehand methods cartographer actually invokes:
+
+- `new Stagehand({...noLlm:true, selfHeal:false...})` + `init()`
+- `stagehand.context.pages()[0]`
+- `stagehand.act(action, {variables})` — `Action` overload, deterministic
+  via `takeDeterministicAction`. No LLM.
+- `page.goto(url)` (via Stagehand's understudy Page) for `navigate` steps
+- `stagehand.close()`
+
+Stagehand methods cartographer does **not** call on the runtime hot path:
+
+- `stagehand.act("click ...")` (string instruction) — would resolve via
+  LLM. Throws in `noLlm` mode.
+- `stagehand.observe(...)` — would resolve via LLM. Throws in `noLlm`
+  mode.
+- `stagehand.agent(...)` — autonomous CUA loop. Throws in `noLlm` mode.
+- Self-heal — disabled at config; the throw inside `resolveLlmClient` is
+  the safety net.
+
+What Stagehand provides for free, beyond raw Playwright:
+
+- Chrome launch + CDP attach + persistent profile (`userDataDir +
+  preserveUserDataDir: true` is what keeps the IG session alive)
+- Iframe-aware XPath traversal (`resolveLocatorWithHops` — supports
+  `>>` hop notation and deep XPath crossing iframe boundaries)
+- CDP-backed `Locator` with shadow-DOM piercing
+- `performUnderstudyMethod` dispatcher for click/fill/type/press/scroll/
+  hover/selectOption
+- `lifecycleWatcher` + `networkManager` for "page settled" detection
+
+Stagehand cache (`ActCache`, `AgentCache`) is instruction-keyed and
+**unused by cartographer**. Cartographer cache is structural:
 
 ```text
-(state_id, atom_id) -> Action[]
+(state_id, atom_id) -> Stagehand-shaped Action[]
 ```
 
-Raw Playwright fallback does not populate Stagehand's own cache. It records
-Cartographer fallback tapes. Promotion turns those tapes into deterministic
-Cartographer skills. Stagehand remains hidden behind `BrowserSession` for known
-skill replay, while default fallback capture stays local and API-key-free.
+Raw Playwright fallback does not populate Stagehand's own cache. It
+records cartographer fallback tapes. Promotion turns those tapes into
+deterministic cartographer skills. The default fallback capture path stays
+local and API-key-free; the default replay path stays local and
+API-key-free; only an opt-in Stagehand-backed fallback (deferred) would
+ever require provider credentials.
 
 ## Verification Commands
 
+Use scoped pnpm filters. Avoid bare `pnpm build` and `pnpm typecheck` —
+they recurse into `@browserbasehq/stagehand-server-v4` whose `build:sea:esm`
+step is currently broken on Node 25 (`Could not find the sentinel
+NODE_SEA_FUSE_*`). The server packages are upstream-only and unrelated to
+cartographer.
+
 ```bash
+# typecheck only what cartographer depends on
+pnpm --filter @browserbasehq/stagehand typecheck
 pnpm --filter @cartographer/core typecheck
-pnpm --filter @cartographer/core build
+
+# build only the dependency chain cartographer needs
+pnpm --filter @cartographer/core... build
+
+# refresh the agent contract + emit the per-site CLI
 node packages/cartographer/dist/cli.js expose-skills instagram.com
+
+# dry-run a known skill before live execution
 ~/.cartographer/bin/instagram-com-cli open-inbox --dry-run
 ```
 
-Live read-only smoke:
+Live read-only smoke (no API key in env):
 
 ```bash
+unset OPENAI_API_KEY ANTHROPIC_API_KEY
 CARTOGRAPHER_LOG_LEVEL=debug ~/.cartographer/bin/instagram-com-cli open-inbox
 ```
 
-Recent smoke result:
+Recent verified smoke (2026-05-03):
 
 ```text
-success:true
-postconditions.required:true
-postconditions.passed:true
-drift.detected:false
+init log:        noLlm:true — LLM-dependent methods will throw if invoked.
+                 Deterministic act(Action) replay works.
+step 1:          cacheHit:true, actionCount:1, drifted:false
+step 2:          cacheHit:true, actionCount:1, drifted:false
+postconditions:  url_contains:/direct/inbox passed
+                 observed:https://www.instagram.com/direct/inbox/
+drift:           detected:false, severity:none
+final:           success:true, executedStepCount:2
 ```
 
 ## Current Gaps
 
+- **`send-message` / `send-test-dm` postcondition is a false-positive trap.**
+  Current `text_contains: body, %message%` passes the moment the message
+  text appears anywhere in the page body, including the compose textarea
+  before the send button is clicked. Silent send failures (rate limits,
+  blocks) will return `success: true`. **Fix before any live write.**
+  Tighten to a selector scoped inside the rendered conversation thread,
+  re-promote affected tapes.
 - Browser lifecycle is still process-bound. The CLI closes Chrome after each
   run. A `--close-browser` or long-lived session model is still pending.
+  Each CLI command pays a fresh Chrome boot.
 - Task envelopes are currently lightweight JSON responses, not persisted task
   records.
 - `open-inbox` and `open-explore` are navigation-only. They have deterministic
-  URL postconditions but no read outputs.
+  URL postconditions but no read outputs. Real read skills (`view_profile`,
+  `list_recent_posts`) should declare structured `outputs` via
+  `--output visibleText:<selector>:<description>` on promotion.
 - Selector generation is deterministic but young.
 - Existing old fallback tapes may not have operation logs or selector
   diagnostics. New Playwright fallback tapes do.
-- Text evidence is explicit. If the operator does not run `text`, review will
-  flag `no_text_evidence`.
-- `FallbackEngine` exists as an interface, but only local Playwright fallback is
-  implemented today. Stagehand fallback should stay optional because it needs
-  external model/API configuration.
+- Text evidence is explicit. If the operator does not run `text`, review
+  will flag `no_text_evidence`.
+- `FallbackEngine` exists as an interface, but only local Playwright fallback
+  is implemented today. Stagehand fallback should stay optional because it
+  would require external model/API configuration (and would need a separate
+  `noLlm:false` Stagehand instance).
 - There is no MCP emitter yet.
 - There is no visual sitemap/graph viewer yet.
+
+### Resolved gaps
+
+- ✅ **Login persistence.** Stagehand's
+  `localBrowserLaunchOptions.userDataDir + preserveUserDataDir: true` keeps
+  IG session cookies between CLI runs. Verified in 2026-05-03 smoke.
+- ✅ **API key requirement.** With `noLlm: true`, Stagehand initializes
+  without any provider credentials. Runtime hot path makes zero LLM calls.
+  Verified in 2026-05-03 smoke.
 
 ## What Not To Do
 
