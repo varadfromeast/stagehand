@@ -260,6 +260,67 @@ StagehandBrowserSession
 Known process replay uses Stagehand-shaped `Action[]` through
 `BrowserSession.actRaw(action)`.
 
+### Stagehand is configured in noLlm mode
+
+`StagehandBrowserSessionFactory.launchInstagram` constructs Stagehand with
+two flags that lock the runtime hot path to deterministic replay:
+
+```ts
+new Stagehand({
+  env: "LOCAL",
+  selfHeal: false,   // selector misses fail loudly, no LLM re-resolution
+  noLlm: true,       // skip API key load + LLM client construction
+  localBrowserLaunchOptions: {
+    userDataDir: <cacheDir>/chrome-profile,
+    preserveUserDataDir: true,   // keeps IG session cookies between runs
+    ...
+  },
+});
+```
+
+`noLlm: true` is a fork-local Stagehand option (see `apply-nollm-patch.mjs`).
+With it set, Stagehand's constructor skips `loadApiKeyFromEnv` entirely and
+`this.llmClient` stays unassigned. `act(Action)` deterministic replay still
+works because `takeDeterministicAction` only invokes the client during
+self-heal, which is gated by `selfHeal: true`.
+
+Cartographer therefore needs **no `OPENAI_API_KEY` (or any provider key)**
+for the runtime hot path. Methods that would invoke an LLM —
+`act(string)`, `observe()`, `agent()`, self-heal — throw a clear error if
+called. Pure replay paths produce zero LLM calls, confirmed in live runs by
+the `noLlm:true` log line on init and `cacheHit: true, actionCount: 1` on
+each step.
+
+### Stagehand methods cartographer actually calls
+
+Of Stagehand's public surface, the runtime uses only:
+
+- `new Stagehand(opts)` + `stagehand.init()` — once per CLI command.
+- `stagehand.context.pages()[0]` — get the active Page.
+- `stagehand.act(action, {variables})` — `act(Action)` overload, no LLM.
+- `page.goto(url)` (via Stagehand's understudy Page) — for `navigate` steps.
+- `stagehand.close()` — once per CLI command.
+
+`stagehand.observe(instruction)` is wired in `BrowserSession.observe()` for
+fallback/teach paths but **must not fire during runtime replay**. With
+`noLlm: true`, accidental invocation throws.
+
+What this gets cartographer for free, beyond raw Playwright:
+
+- Chrome launch + CDP attach + persistent profile management (`launch/local.ts`)
+- `V3Context` + frame registry + iframe traversal
+- Stagehand's `Locator` engine with shadow-DOM piercing
+- `resolveLocatorWithHops` — iframe-aware XPath traversal (`iframe#x >> #btn`
+  and deep XPath `/html/body/iframe[1]/...` are split at iframe boundaries
+  automatically)
+- `performUnderstudyMethod` dispatcher (`click`, `fill`, `type`, `press`,
+  `scroll`, `hover`, `selectOption`, etc.) backed by raw CDP
+- `lifecycleWatcher` + `networkManager` for "page settled" detection
+
+Net: ~2,400 LOC of browser/CDP infrastructure that cartographer does not
+have to write or maintain. As Stagehand evolves the substrate, cartographer
+inherits the upgrades.
+
 ## Layer 7: Validation And Drift
 
 `ReplayValidator` validates:
@@ -623,87 +684,138 @@ writes, or query complexity makes file storage painful.
 
 ## Stagehand Cache Versus Cartographer Cache
 
-Stagehand cache:
+Stagehand cache (`ActCache`, `AgentCache`):
 
 - keyed by instruction, URL, variables, and config
-- used for successful string `act("...")` calls
+- populated by successful `act("...")` and `agent.execute(...)` calls
 - useful for Stagehand natural-language actions
 
-Cartographer cache:
+**Cartographer does not use Stagehand's cache at all.** With `noLlm: true`
+the actCache/agentCache callbacks throw if invoked, but they're never
+consulted because `act(Action)` skips the cache path entirely (it routes
+straight to `takeDeterministicAction`).
 
-- keyed structurally by state and atom
-- stores replayable `Action[]`
+Cartographer cache (`StateActionCache`):
+
+- keyed structurally by `(state_id, atom_id)`
+- stores replayable Stagehand-shaped `Action[]`
 - used by named process tapes
-- intended for reuse across processes, not across phrasings
+- benefits from cross-process edge reuse — different Processes traversing
+  the same `(from_state → atom → to_state)` triple share a single entry
 
 Raw Playwright fallback does not populate Stagehand cache. It records
 Cartographer fallback tapes. Promotion turns those tapes into deterministic
 Cartographer skills.
 
-Stagehand remains useful for known skill replay because process tapes store
-Stagehand-shaped `Action[]`. It is not the default fallback recorder because
-that would require external model/API setup. The V1 acquisition path should
-work locally with Playwright.
+Stagehand remains the runtime substrate for known-skill replay because
+process tapes store Stagehand-shaped `Action[]`. It is not the default
+fallback recorder because that would require external model/API setup.
+The V1 acquisition path works locally with Playwright; the V1 replay path
+works locally with Stagehand in `noLlm: true` mode.
 
 ## Current Happy Path Example
 
 Task:
 
 ```text
-Open Instagram Explore.
+Open Instagram Inbox.
 ```
 
-Current path:
+Live-verified path (smoke 2026-05-03):
 
 1. Agent reads `SKILL.md` or `manifest.json`.
-2. Agent sees `open-explore`.
+2. Agent sees `open-inbox`.
 3. Agent runs:
 
    ```bash
-   instagram-com-cli open-explore
+   ~/.cartographer/bin/instagram-com-cli open-inbox
    ```
 
-4. CLI calls `ProcessTapeRuntime`.
-5. Runtime replays the saved navigation process.
-6. Final postcondition checks URL contains `/explore`.
-7. Agent receives `success:true`.
+4. CLI calls `createPreloadedRuntime` → `ProcessTapeRuntime`.
+5. `StagehandBrowserSessionFactory.launchInstagram` constructs Stagehand
+   with `noLlm:true`, `selfHeal:false`. Init log:
+   `noLlm:true — LLM-dependent methods will throw if invoked. Deterministic act(Action) replay works.`
+6. Runtime replays the saved 2-step process (`goto-inbox`, `open_inbox`).
+   Both steps log `cacheHit: true, actionCount: 1`. Zero LLM calls.
+7. Browser ends at `https://www.instagram.com/direct/inbox/`. Login
+   persisted from prior session via `userDataDir + preserveUserDataDir`.
+8. Final postcondition `url_contains:/direct/inbox` passes against observed
+   URL. `drift.detected: false`.
+9. Agent receives `success:true`.
 
-Expected result shape:
+Verified result:
 
 ```json
 {
   "success": true,
-  "processName": "open_explore",
+  "processName": "open_inbox",
+  "executedStepIds": ["34dea10a09d1...", "21cdea9ae864..."],
+  "driftedStepIds": [],
+  "outputs": {},
   "execution": {
     "completed": true,
+    "stepCount": 2,
+    "executedStepCount": 2,
     "actionFailures": []
   },
   "postconditions": {
     "required": true,
-    "passed": true
+    "passed": true,
+    "checks": [{
+      "type": "url_contains",
+      "passed": true,
+      "expected": "/direct/inbox",
+      "observed": "https://www.instagram.com/direct/inbox/"
+    }]
   },
-  "drift": {
-    "detected": false
-  },
-  "outputs": {}
+  "drift": { "detected": false, "severity": "none", "steps": [] },
+  "message": "Replayed 2 step(s); postconditions passed."
 }
 ```
 
+This run validates the full architectural claim end-to-end:
+
+- Stagehand initialized with no API key
+- StateActionCache hit on every step
+- Login persisted via Stagehand's user data dir
+- Postconditions decided success (drift was diagnostic only)
+- JSON contract returned cleanly on stdout
+
+The other listed read command (`open-explore`) follows the same pattern.
+Write commands (`send-message`, `send-test-dm`) are gated behind
+`--confirm-write` and have a known postcondition tightening pending
+(see "What Comes Next").
+
 ## What Comes Next
 
-Best next steps:
+Best next steps, ordered by leverage:
 
-1. Add browser lifecycle control: `--close-browser` or a long-lived session
-   model. Current runtime closes Chrome after each CLI run.
-2. Persist task envelopes so learning debt can be listed and enforced.
-3. Create real read skills with explicit outputs, not just navigation skills.
-4. Improve default Playwright fallback with automatic text evidence prompts and
-   stronger selector repair.
-5. Add richer fallback commands for search/profile browsing workflows.
-7. Add richer dry-run/replay plans.
-8. Add MCP emitter after the CLI contract stabilizes.
-9. Add compact page inspection only as supporting observability, not as the
-   core success model.
+1. **Tighten write postconditions.** `send-message` / `send-test-dm`
+   currently use `text_contains: body, %message%` which passes the moment
+   the message text appears anywhere in the page body — including the
+   compose textarea before the send button is clicked. This is a
+   false-positive trap for silent send failures (rate limits, blocks). Scope
+   the postcondition to a selector inside the rendered conversation thread,
+   not the page body. Re-promote affected tapes after fixing.
+2. **Add browser lifecycle control:** `--close-browser` / `--keep-alive`
+   or a long-lived session model. Current runtime closes Chrome after each
+   CLI run. Cheap commands feel slow because each one boots Chrome.
+3. **Persist task envelopes** so learning debt can be listed and enforced.
+4. **Create real read skills with explicit outputs**, not just navigation
+   skills. `view_profile`, `list_recent_posts`, `read_post_detail` would
+   produce structured `outputs` blocks instead of empty objects.
+5. **Improve default Playwright fallback** with automatic text evidence
+   prompts and stronger selector repair.
+6. **Add richer fallback commands** for search/profile browsing workflows.
+7. **Add richer dry-run/replay plans.**
+8. **Add MCP emitter** after the CLI contract stabilizes.
+9. **Add compact page inspection** only as supporting observability, not as
+   the core success model.
+
+Login persistence is no longer pending — Stagehand's
+`localBrowserLaunchOptions.userDataDir + preserveUserDataDir: true` keeps
+Instagram session cookies between CLI runs. Verified in the 2026-05-03
+smoke.
 
 The immediate product win is better command contracts: clear args, outputs,
 postconditions, and failure packets.
