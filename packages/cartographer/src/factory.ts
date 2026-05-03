@@ -1,6 +1,5 @@
 import type { CartographerRuntime, Domain } from "./contracts.js";
 import { StagehandBrowserSessionFactory } from "./browser-session.js";
-import { JsonStateActionCache } from "./state-action-cache.js";
 import { BasicStateIdentity } from "./state-identity.js";
 import { JsonTapeStore } from "./tape-store.js";
 import { ProcessTapeRuntime } from "./runtime.js";
@@ -14,7 +13,6 @@ export function createRuntime(): CartographerRuntime {
     new StagehandBrowserSessionFactory(),
     new BasicStateIdentity(),
     registry,
-    new JsonStateActionCache(),
     undefined,
     logger,
   );
@@ -28,7 +26,6 @@ export async function createPreloadedRuntime(domain: Domain): Promise<Cartograph
     new StagehandBrowserSessionFactory(),
     new BasicStateIdentity(),
     registry,
-    new JsonStateActionCache(),
     undefined,
     logger,
   );

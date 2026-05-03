@@ -16,7 +16,6 @@ import type {
   RuntimeArgs,
   SkillRegistry,
   State,
-  StateActionCache,
   StateFingerprint,
   StateIdentity,
   StepValidator,
@@ -34,7 +33,6 @@ export class ProcessTapeRuntime implements CartographerRuntime {
     private readonly sessionFactory: BrowserSessionFactory,
     private readonly identity: StateIdentity,
     private readonly skillRegistry: SkillRegistry,
-    private readonly actionCache: StateActionCache,
     private readonly replayValidator: ReplayValidator = new DefaultReplayValidator(),
     private readonly logger: CartographerLogger = new ConsoleCartographerLogger(),
   ) {}
@@ -144,15 +142,9 @@ export class ProcessTapeRuntime implements CartographerRuntime {
           });
         }
 
-        const cached = await this.actionCache.get({
-          domain: input.domain,
-          beforeStateId: step.before.id,
-          atomId: step.atomId,
-        });
-        const actions = cached?.actions.length ? cached.actions : step.actions;
-        this.logger.log(cached?.actions.length ? "info" : "debug", "runtime.step.cache", {
+        const actions = step.actions;
+        this.logger.log("debug", "runtime.step.actions", {
           stepName: step.name,
-          cacheHit: Boolean(cached?.actions.length),
           actionCount: actions.length,
         });
         for (const action of actions) {
@@ -210,17 +202,6 @@ export class ProcessTapeRuntime implements CartographerRuntime {
             stableAtomRatio: diff.stableAtomRatio,
             failures: validation.failures,
           });
-          await this.actionCache.markDrifted(
-            {
-              domain: input.domain,
-              beforeStateId: step.before.id,
-              atomId: step.atomId,
-            },
-            [
-              `Expected ${expectedFingerprint.hash}, observed ${observedFingerprint.hash}`,
-              ...validation.failures,
-            ].join("; "),
-          );
         }
         this.logger.log("info", "runtime.step.done", {
           stepName: step.name,
