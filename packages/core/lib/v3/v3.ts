@@ -356,6 +356,18 @@ export class V3 {
       this.llmClient = opts.llmClient;
       this.modelClientOptions = baseClientOptions;
       this.disableAPI = true;
+    } else if (opts.noLlm) {
+      // noLlm mode: skip API key load and LLM client construction entirely.
+      // `this.llmClient` stays unassigned. `resolveLlmClient()` throws if
+      // invoked, and `act(Action)` with `selfHeal:false` never invokes it.
+      // See V3Options.noLlm docs.
+      this.modelClientOptions = baseClientOptions;
+      this.logger({
+        category: "init",
+        message:
+          "noLlm:true — LLM-dependent methods (act(string), observe, agent, self-heal) will throw if invoked. Deterministic act(Action) replay works.",
+        level: 1,
+      });
     } else {
       // Ensure API key is set
       let apiKey = (baseClientOptions as { apiKey?: string }).apiKey;
@@ -540,6 +552,13 @@ export class V3 {
 
   private resolveLlmClient(model?: ModelConfiguration): LLMClient {
     if (!model) {
+      if (!this.llmClient) {
+        throw new Error(
+          "[Stagehand] LLM client not configured (noLlm:true or missing API key). " +
+            "act(string), observe(), agent(), and self-heal require an LLM client. " +
+            "Use act(Action) with selfHeal:false for deterministic replay only.",
+        );
+      }
       return this.llmClient;
     }
 
@@ -1257,11 +1276,17 @@ export class V3 {
             options?.timeout,
             (ms) => new ActTimeoutError(ms),
           );
+          // In noLlm mode, skip resolveLlmClient() — it would throw, and
+          // takeDeterministicAction only uses the client during self-heal,
+          // which is gated by `selfHeal:true` (not enabled in noLlm flows).
+          const llmClientForReplay = this.opts.noLlm
+            ? (undefined as unknown as LLMClient)
+            : this.resolveLlmClient(options?.model);
           actResult = await this.actHandler.takeDeterministicAction(
             { ...input, selector },
             v3Page,
             this.domSettleTimeoutMs,
-            this.resolveLlmClient(options?.model),
+            llmClientForReplay,
             ensureTimeRemaining,
             options?.variables,
           );
@@ -1976,7 +2001,10 @@ export class V3 {
         cua: { value: isCuaMode ? "true" : "false", type: "boolean" },
         mode: { value: loggedMode, type: "string" },
         model: {
-          value: extractModelName(options?.model) ?? this.llmClient.modelName,
+          value:
+            extractModelName(options?.model) ??
+            this.llmClient?.modelName ??
+            "<not-configured>",
           type: "string",
         },
         systemPrompt: { value: options?.systemPrompt ?? "", type: "string" },

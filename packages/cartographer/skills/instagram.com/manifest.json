@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "domain": "instagram.com",
-  "generatedAt": "2026-05-03T06:50:38.195Z",
+  "generatedAt": "2026-05-03T09:14:52.622Z",
   "agentContract": {
     "toolSelection": "agent-controlled",
     "commandExecution": "cli-controlled",
