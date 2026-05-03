@@ -1,6 +1,7 @@
 packages:
   - "packages/core"
   - "packages/cli"
+  - "packages/cartographer"
   - "packages/evals"
   - "packages/docs"
   - "packages/server-v3"

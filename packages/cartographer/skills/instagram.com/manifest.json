@@ -1,0 +1,182 @@
+{
+  "schemaVersion": 1,
+  "domain": "instagram.com",
+  "generatedAt": "2026-05-03T06:50:38.195Z",
+  "agentContract": {
+    "toolSelection": "agent-controlled",
+    "commandExecution": "cli-controlled",
+    "successRule": "success is true only when actions complete and final postconditions pass",
+    "driftRule": "hash drift is diagnostic and does not fail a command by itself",
+    "fallbackRule": "use fallback recording when no listed command fits or an invoked command fails",
+    "learningRule": "if fallback is used, end-task review is required and every reusable fallback should be promoted into a CLI command"
+  },
+  "taskLifecycle": {
+    "beginTaskCommand": "node packages/cartographer/dist/cli.js begin-task instagram.com --intent <task>",
+    "fallbackCreatesLearningDebt": true,
+    "closeoutRequiredWhenFallbackUsed": true,
+    "reviewCommandPattern": "node packages/cartographer/dist/cli.js end-task-review instagram.com --since <taskStartedAt>",
+    "decisions": [
+      "promote",
+      "reject",
+      "delete"
+    ],
+    "promotionCriteria": [
+      "generic",
+      "repeatable",
+      "safe",
+      "deterministic-postconditions"
+    ],
+    "promotionPolicy": {
+      "name": "v1",
+      "enforced": [
+        "command name must be snake_case and unique",
+        "fallback tape must have succeeded and must not already be promoted",
+        "fallback tape must contain at least one recorded step",
+        "description must explicitly describe what the command does",
+        "write commands are write-protected if the tape or any step writes",
+        "deterministic final postconditions are required",
+        "write promotions require explicit postconditions",
+        "runtime placeholders must have declared args",
+        "output contracts must have valid names, selectors, and descriptions"
+      ],
+      "advisory": [
+        "the agent is responsible for deciding whether the tape is semantically generic and reusable",
+        "non-write commands without outputs are navigation/state commands only",
+        "prefer rejecting a broad task fallback and promoting only a smaller reusable sub-operation"
+      ]
+    },
+    "promotionDecisionWorkflow": {
+      "createReviewCommand": "node packages/cartographer/dist/cli.js create-promotion-review instagram.com <fallback-id>",
+      "applyDecisionCommand": "node packages/cartographer/dist/cli.js apply-promotion-decision instagram.com --decision-file <decision.json>",
+      "agentInstruction": "Reason over review-request.json, use decision-template.json as the starting shape when useful, and return one flat PromotionDecision JSON. Do not run promotion commands directly in normal workflow.",
+      "decisionActions": [
+        "promote",
+        "reject",
+        "delete"
+      ],
+      "afterPromotion": "Treat agentContractDelta from the apply result as an immediate patch to the working command contract. Use reusableCommand.command, or refresh SKILL.md/manifest.json, to reuse the acquired CLI skill."
+    }
+  },
+  "cli": {
+    "binName": "instagram-com-cli",
+    "commandPattern": "instagram-com-cli <command> [--dry-run] [--confirm-write] [--key value]",
+    "fallbackCommand": "node packages/cartographer/dist/cli.js fallback instagram.com --intent <task>",
+    "reviewCommand": "node packages/cartographer/dist/cli.js end-task-review instagram.com"
+  },
+  "commands": [
+    {
+      "name": "open-explore",
+      "processName": "open_explore",
+      "description": "open Instagram Explore page",
+      "writesToPlatform": false,
+      "args": [],
+      "outputs": [],
+      "postconditions": [
+        {
+          "type": "url_contains",
+          "value": "/explore"
+        }
+      ],
+      "success": {
+        "actionFailuresFailCommand": true,
+        "postconditionsMustPass": true,
+        "driftOnlyFailsCommand": false
+      },
+      "failureFields": [
+        "failure",
+        "execution.actionFailures",
+        "postconditions.checks",
+        "drift.steps"
+      ]
+    },
+    {
+      "name": "open-inbox",
+      "processName": "open_inbox",
+      "description": "open Instagram direct messages inbox",
+      "writesToPlatform": false,
+      "args": [],
+      "outputs": [],
+      "postconditions": [
+        {
+          "type": "url_contains",
+          "value": "/direct/inbox"
+        }
+      ],
+      "success": {
+        "actionFailuresFailCommand": true,
+        "postconditionsMustPass": true,
+        "driftOnlyFailsCommand": false
+      },
+      "failureFields": [
+        "failure",
+        "execution.actionFailures",
+        "postconditions.checks",
+        "drift.steps"
+      ]
+    },
+    {
+      "name": "send-message",
+      "processName": "send_message",
+      "description": "send message in current Instagram direct thread",
+      "writesToPlatform": true,
+      "args": [
+        {
+          "name": "message",
+          "required": true,
+          "description": "DM message text"
+        }
+      ],
+      "outputs": [],
+      "postconditions": [
+        {
+          "type": "text_contains",
+          "selector": "body",
+          "value": "%message%"
+        }
+      ],
+      "success": {
+        "actionFailuresFailCommand": true,
+        "postconditionsMustPass": true,
+        "driftOnlyFailsCommand": false
+      },
+      "failureFields": [
+        "failure",
+        "execution.actionFailures",
+        "postconditions.checks",
+        "drift.steps"
+      ]
+    },
+    {
+      "name": "send-test-dm",
+      "processName": "send_test_dm",
+      "description": "send a test DM to va_rad_",
+      "writesToPlatform": true,
+      "args": [
+        {
+          "name": "message",
+          "required": true,
+          "description": "DM message text"
+        }
+      ],
+      "outputs": [],
+      "postconditions": [
+        {
+          "type": "text_contains",
+          "selector": "body",
+          "value": "%message%"
+        }
+      ],
+      "success": {
+        "actionFailuresFailCommand": true,
+        "postconditionsMustPass": true,
+        "driftOnlyFailsCommand": false
+      },
+      "failureFields": [
+        "failure",
+        "execution.actionFailures",
+        "postconditions.checks",
+        "drift.steps"
+      ]
+    }
+  ]
+}

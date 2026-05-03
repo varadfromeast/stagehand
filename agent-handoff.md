@@ -1,580 +1,509 @@
-# Agent Handoff — Cartographer (Stagehand fork)
+# Agent Handoff - Cartographer V1
 
-## Current State
+Cartographer is a CLI skill layer built in this Stagehand fork. The product
+shape is:
 
-This is a fork of [`browserbase/stagehand`](https://github.com/browserbase/stagehand)
-created on 2026-05-01 to host the **Cartographer** project.
+1. External agents read the generated `SKILL.md` and optional `manifest.json`.
+2. For substantial or unfamiliar tasks, the agent calls `begin-task` to get a
+   scoped `taskStartedAt` and required review command.
+3. The agent chooses a deterministic per-site CLI command when one directly
+   fits the user task.
+4. The CLI executes only the named command. It does not infer broad intent.
+5. Runtime replays the recorded process tape and validates final
+   postconditions.
+6. Command JSON returns structured execution, postcondition, drift, output, and
+   failure data.
+7. If no listed command fits, or a command fails, the agent explicitly enters
+   browser fallback recording.
+8. Saving a fallback creates learning debt and prints a scoped review command.
+9. After the user task is complete, fallback tapes are reviewed.
+10. Reusable fallbacks are promoted into new CLI commands, regenerated
+   `SKILL.md`, and regenerated `manifest.json`.
 
-Cartographer is the successor to `siteforge` (now abandoned). The siteforge
-experiment validated the core thesis — an agent's per-site navigation cost can
-be cached into a state-graph and replayed deterministically — but tried to
-rebuild Stagehand's substrate from scratch (atom extraction, XPath resolution,
-self-healing replay, etc.). That was the wrong layer. **Stagehand has already
-shipped 60–70% of what siteforge was rebuilding.** This fork is the pivot:
-build the graph + emitter + workflow layer on top of Stagehand instead of
-replacing it.
+The key boundary is MCP-like: tool selection is agent-controlled, command
+execution is CLI-controlled.
 
-The arc is:
+Use `ubiquitous_language.md` for shared domain vocabulary. In particular,
+fallback creates learning debt: after a fallback is used, the agent must run
+end-of-task review and either promote, reject, or delete each reviewed fallback.
 
-```
-fork upstream stagehand
-    ↓
-add 5 new packages alongside packages/core
-    ↓
-state identity layer over Stagehand snapshots
-    ↓
-state-keyed cache (cross-process edge reuse — Stagehand's blind spot)
-    ↓
-proactive cartographer (active exploration, safety-gated)
-    ↓
-path planner + runtime (replay paths through Stagehand)
-    ↓
-emit per-site CLI + MCP + 2D viewer
-    ↓
-campaigns package (build → review → send pipeline)
-    ↓
-agents browse known sites → build qualified lists → send carefully
-```
+## Current Status
 
-**End goal:** make navigating known sites for agents as cheap as querying a
-GitNexus-indexed codebase, **and** turn that into actionable bulk-workflow
-tooling (lead lists, outbound campaigns, research artifacts, recruiting,
-competitive intel) where one indexed site benefits every workflow built on it.
+Implemented package:
 
-## Why fork instead of build a separate package?
-
-We chose fork because we want:
-- Easy `git pull upstream main` to track Stagehand's fast-moving work
-- Visibility into Stagehand's internals (`understudy/a11y/snapshot/`, `ActCache.ts`,
-  `flowlogger/`) when the consumer API isn't enough
-- Future option to upstream parts of the cartographer as PRs
-
-We are **not** modifying `packages/core/`. All cartographer work lives in new
-packages alongside it.
-
-## Repo Layout
-
-```
-stagehand/
-  packages/
-    core/             ← upstream — never modified
-    docs/             ← upstream
-    cli/              ← upstream Stagehand CLI
-    server-v3/        ← upstream
-    server-v4/        ← upstream
-    evals/            ← upstream
-    cartographer/     ← NEW — exploration + map recording
-    runtime-graph/    ← NEW — state-keyed cache + planner + replayer
-    emitters/         ← NEW — CLI + MCP generators
-    viewer/           ← NEW — 2D graph UI (3D toggle planned)
-    campaigns/        ← NEW — platform-agnostic build / review / send pipeline
+```text
+packages/cartographer/
 ```
 
-Each new package depends on `@browserbasehq/stagehand` like any external
-consumer. No source-level coupling to `packages/core/`.
+Current site:
 
-## What Stagehand Already Provides (use, don't rebuild)
-
-After deep-reading `lib/v3/`:
-
-- **`Stagehand.observe(instruction)`** → `Action[]` with full XPath. This is
-  the atom-enumeration primitive. **Replaces siteforge's broken atom
-  extractor** — XPaths are populated for free.
-- **`Stagehand.act(action | instruction)`** → executes one action; the cached
-  `ActCache.replayCachedActions` already runs `takeDeterministicAction` per
-  action with self-heal write-back.
-- **`Stagehand.agent(config)`** → autonomous CUA loop with `AgentCache` that
-  records `AgentReplayStep[]` and replays without LLM tokens (see
-  `examples/cua-replay.ts`).
-- **`captureHybridSnapshot(page)`** (in `understudy/a11y/snapshot/`) →
-  `combinedTree` (text a11y) + `combinedXpathMap` (encodedId → XPath).
-- **`CacheStorage`** → pluggable JSON-on-disk cache primitive. Pattern shown
-  in `cache/ActCache.ts` and `cache/AgentCache.ts`.
-- **`FlowLogger.EventStore`** → query `(sessionId, eventType, limit)` to walk
-  all events. Subscribe for graph recording, drift detection.
-- **`takeDeterministicAction(action, page, ...)`** → executes a cached
-  `Action` without LLM. Used internally by `ActCache`. Public-ish via
-  `ActHandler`.
-- **Browserbase + local Chrome session management, viewport handling,
-  iframe traversal, shadow-root piercing** — all done.
-
-## What Stagehand Does NOT Do (the gap = our novelty)
-
-Stagehand's `ActCache` and `AgentCache` are both keyed by
-`sha256(instruction, url, options, configSig, variableKeys)` — the natural-
-language instruction string is part of the cache key. That means:
-
-1. **No cross-process edge reuse.** Two named Processes that traverse the
-   same `(from_state → atom → to_state)` edge cannot share a cache entry,
-   because Stagehand keys by the literal instruction wording. Cartographer's
-   `StateActionCache` keys by `(state_id, atom_id)` — pure graph position —
-   so any Process passing through that edge benefits, regardless of how the
-   user phrased the request.
-2. **No graph / state model.** No "I'm in state X, here are the available
-   transitions." Just opaque cache entries hashed by inputs.
-3. **No proactive exploration.** Cache is populated reactively; first run of
-   each new instruction pays full LLM cost.
-4. **No path planning.** Can't ask "shortest cached path from current state
-   to target state."
-5. **No emitted artifacts.** `cacheDir` is dev-side; no per-site CLI binary,
-   no MCP server *generated* from the cache.
-6. **No site-level drift signal.** Self-heal happens per-edge but isn't
-   aggregated into "this site changed, time to re-explore."
-7. **No campaign tooling.** No list-building, no human-review queue, no
-   paced send loop. Stagehand stops at "execute one task." Real bulk
-   workflows (outbound, enrichment, research) need the workflow layer above.
-
-These are exactly the layers Cartographer adds.
-
-## Cache Semantics — Be Precise
-
-The `StateActionCache` is **structural, not semantic**. The cache key is
-`(state_id, atom_id)` — a pure function of graph position. The natural-
-language instruction never enters the cache key. There is no embedding, no
-LLM similarity check, no synonym detection.
-
-**Worked example.** After Cartographer indexes Instagram, two Processes:
-
-```
-Process "open_inbox"
-  edges: [home_state → inbox_btn → inbox_state]
-
-Process "send_dm_to_alice"
-  edges: [home_state → inbox_btn → inbox_state,
-          inbox_state → alice_thread_btn → thread_state,
-          thread_state → message_textbox → thread_filled,
-          thread_filled → send_btn → thread_sent]
+```text
+instagram.com
 ```
 
-First call: `cartographer.run("open_inbox")`
-- Compute current state_id = sha256(canonicalized atoms) → "home_state".
-- Look up `(home_state, inbox_btn_atom_id)` in StateActionCache → **MISS**.
-- Fall back: `stagehand.act("click the inbox button")` resolves the selector
-  via LLM, executes via `takeDeterministicAction`.
-- Write result to cache: `(home_state, inbox_btn_atom_id) → cached Action[]`.
-
-Second call: `cartographer.run("send_dm_to_alice")`
-- Compute current state_id → "home_state" (back at home).
-- First edge: look up `(home_state, inbox_btn_atom_id)` → **HIT**.
-- Replay cached Action via `takeDeterministicAction`. **No LLM call.**
-- Subsequent edges resolve the same way (hit if seen, miss if new).
-
-The reuse is between **Processes**, not between phrasings. Two completely
-different goals (`open_inbox` and `send_dm_to_alice`) share the same first
-edge by graph structure, not by linguistic similarity.
-
-If a future use case requires "user types free-form, system finds the right
-process," that's a separate **Process Resolver** layer above the cache —
-optional, deferred to v2. The cache itself stays structural.
-
-## Workstreams
-
-### A — State Identity Layer (foundational)
-
-Take Stagehand's hybrid snapshot (or `observe()` results) and produce a
-stable `StateId` (sha256 of canonicalized atom-set). Two visits to the same
-logical screen → same id, even when content differs.
-
-**Stagehand provides:** `combinedTree`, `combinedXpathMap`, `Action[]` from
-`observe()`.
-
-**You build:** `canonicalizeAtoms()` (filter noise), `surfaceFilter` plugin
-hook (per-site predicates), `hashAtomSet()` (sha256).
-
-**Doability: HIGH.** ~300–500 LOC. Most of `siteforge/src/core/canonicalize.ts`
-and `hash.ts` ports directly.
-
-**Risk:** State hash stability across sessions is the load-bearing assumption.
-**Mitigation: build the cross-session-stability test FIRST (Spike 1).**
-
-### B — State-Keyed Cache (the actual novelty)
-
-A new cache class `StateActionCache` keyed by `(state_id, atom_id)` — "from
-this logical state, executing this atom yields these `Action[]` and lands at
-that state."
-
-**Stagehand provides:** `CacheStorage` is pluggable; `ActCache.ts` shows the
-shape (read/write JSON, self-heal write-back, variables).
-
-**You build:** A new cache class with `(from_state, atom_id) → action_list`
-keying. Self-heal falls back to `Stagehand.act(atom.description)` and writes
-back the new actions.
-
-**Why this is the win:** structural key → cross-process edge reuse. Stagehand
-cannot do this today (instruction-keyed). See "Cache Semantics" above for
-worked example.
-
-**Doability: HIGH.** ~400–600 LOC. Mirrors `ActCache.ts` (387 LOC) with
-different keying.
-
-**Risk:** Atom IDs need to disambiguate "like button on home" vs "like button
-in reels modal." Use `atom_id = sha256(role + accessible_name + xpath_shape)`
-where `xpath_shape` is a path-template (drop indices, keep tag names).
-
-### C — Cartographer (proactive exploration)
-
-The site cartographer plan from siteforge's `SITE_CARTOGRAPHER_PLAN.md`,
-rebuilt on Stagehand primitives. Drives `observe()` to enumerate, `act()` to
-validate, records edges into the graph.
-
-**Stagehand provides:** `observe()` for ENUMERATE, `act()` for VALIDATE,
-`bus.emit('screenshot', ...)` for evidence, session management for SETUP.
-
-**You build:** `Cartographer` class wrapping a Stagehand instance.
-`Policy` interface with implementations (`RulePolicy`, later `PromptPolicy`,
-`LlmPolicy`, `HybridPolicy`). `SafetyGate` with default-deny verb list.
-`MapRecorder` writing `graph.json` via `FlowLogger` event subscription.
-
-**Doability: HIGH for Phase 1, MEDIUM for Phase 3.** Phase 1 (RulePolicy with
-hardcoded patterns + safety gate + recorder): ~1000 LOC. Phase 2
-(prompt-aware): +500. Phase 3 (LLM policy): +500.
-
-**Risks:**
-- Anti-detection during automated exploration → use Browserbase tier or
-  rate-limit + jitter on local. Min 1s throttle.
-- Backtracking via `page.goBack()` works ~80%; maintain anchor URLs as
-  fallback.
-- Phase 3 (what should the LLM policy decide?) is genuinely hard — punt to
-  v2; ship Phase 1 with rule-based discovery.
-
-### D — Path Planner + Runtime
-
-BFS over the graph for shortest path; replay edges via
-`takeDeterministicAction`; self-heal via `act()` with write-back.
-
-**Stagehand provides:** `ActHandler.takeDeterministicAction(action, page, ...)`
-is the public-ish "execute without LLM" API. Confirm via Spike 2.
-
-**You build:** `planPath(graph, from, to)` (BFS — siteforge's `core/plan-path.ts`
-ports as-is), `replayEdge(operation)` wrapping `takeDeterministicAction`,
-fallback to `act(operation.instruction)` on failure, write-back on heal.
-
-**Doability: HIGH.** ~400 LOC.
-
-### E — CLI Emitter
-
-Compile a `SiteGraph` into a per-site CLI binary. Each `Process` becomes a
-subcommand. Args from `Process.args`. Subcommand internally: load graph →
-planPath → replay.
-
-**Stagehand provides:** Nothing specific.
-
-**You build:** Template-based generator. Read graph → for each Process, emit
-a Commander subcommand → bundle with esbuild → ship as
-`~/.cartographer/bin/<domain>-cli`.
-
-**Doability: HIGH.** ~400–600 LOC. Hard part isn't emit — it's having
-well-named Processes (Workstream C Phase 4 / hand-curated v1).
-
-### F — MCP Emitter
-
-Generate a per-site MCP server exposing the graph as resources
-(`site://<domain>/states`, `site://<domain>/processes`, etc.) and tools
-(`run_process`, `find_path`, `validate`, `explore`).
-
-**Stagehand provides:** `@modelcontextprotocol/sdk` is already a peer dep;
-`lib/v3/mcp/connection.ts` shows MCP client patterns.
-
-**You build:** Template-based generator producing a Node script that loads
-the graph, exposes resources via MCP SDK (each ≤500 tokens), exposes tools
-backed by your runtime.
-
-**Doability: HIGH.** ~500 LOC.
-
-### G — Drift Signal at the Site Level
-
-Aggregate per-edge drift events (when self-heal fires) into a per-site
-`drift_score`. Surface via `cartographer status <domain>` or as MCP resource.
-
-**Stagehand provides:** `FlowLogger.EventStore.query()` — subscribe to
-events, including replay misses and self-heals, with `sessionId` and
-`eventType` filters.
-
-**You build:** A subscriber that watches FlowLogger for `StateActionCache`
-misses and self-heal events, increments per-edge `drift_score`, persists to
-graph metadata.
-
-**Doability: HIGH.** ~200 LOC.
-
-### H — 2D Graph Viewer (3D toggle later)
-
-Visualize the site graph. Force-directed, cluster-coloured, hover for state
-preview, click to play replay.
-
-**Stagehand provides:** Nothing.
-
-**You build:** A small web app using `react-force-graph-2d` (same author has
-a drop-in 3D variant). Reads `graph.json`, renders force layout, surfaces
-drift.
-
-**Doability:**
-- 2D: HIGH. ~600–1000 LOC. `react-force-graph-2d` does most of the work.
-- 3D: MEDIUM. Same library has `react-force-graph-3d` — drop-in swap, same
-  data shape. The hard part isn't 3D rendering, it's whether 3D adds value
-  for sparse graphs (it doesn't, for ≤50 nodes).
-
-**Recommendation:** Build 2D first. Add 3D as a `--3d` toggle in v1.5 once
-the graph is dense enough (50+ states across multiple sites) for 3D to be
-useful and not just decorative.
-
-GitNexus uses **Sigma.js + Graphology** (also 2D). Their stack is a fine
-reference; we use `react-force-graph-2d` because it's friendlier for our
-size and gives a free 3D upgrade path.
-
-### I — Campaigns Package (the workflow layer)
-
-Platform-agnostic list-building + human-review + paced-send pipeline. Sits
-ON TOP of the per-site CLI/MCP that emitters produce. Turns "indexed graph"
-into "actionable bulk workflow." This is what makes Cartographer a product
-rather than plumbing.
-
-Three phases, each with its own risk profile:
-
-| Phase | Activity | Platform risk | Throttle |
-|---|---|---|---|
-| 1: Build | hashtag walks, profile views, post reads, LLM reasoning, draft DMs | LOW (reads only) | Light: 1–3s between actions |
-| 2: Review | none — local file inspection by human | NONE | n/a |
-| 3: Send | DMs / outbound writes | HIGH | Heavy: ≤5–10/day, randomized 30–90m delays |
-
-**Critical insight: discovery (Phase 1) and sending (Phase 3) are completely
-uncoupled.** Phase 1 can run at full Cartographer speed against 500
-candidates in a single day. Phase 3 sends 10/day for weeks afterward. This
-is the right pattern for outbound, lead enrichment, competitive intel,
-recruiting — any site-based bulk task.
-
-**Stagehand provides:** nothing specific. Sits on top of cartographer + emitters.
-
-**You build:**
-- CLI subcommands: `cartographer-campaign new/build/review/send/status`
-- File schemas under `~/.cartographer/campaigns/<name>/`:
-  - `config.yaml` — seed source, filters, qualify prompt, draft prompt,
-    safety caps
-  - `prospects.jsonl` — Phase 1 output, one Prospect per line
-  - `approved.jsonl` — Phase 2 output, ApprovedProspect with optional edits
-  - `rejected.jsonl` — explicit rejections, never re-shown
-  - `sent.jsonl` — Phase 3 audit log, one SentRecord per line
-  - `notes/` — per-prospect screenshots from cartographer evidence
-- Resumable build loop with progressive jsonl writes (kill mid-run, restart picks up)
-- Human-review interface (TUI v1, web UI v1.5) with approve/edit/reject
-- Paced sender with daily caps, randomized jitter, account isolation, audit log
-- Multi-account support (run different campaigns from different sessions)
-
-**Doability: HIGH.** ~600–1000 LOC for the package. Build loop ~150 LOC,
-review TUI ~200, sender ~150, schemas + glue ~300.
-
-**Risk:** None within Cartographer code. Platform-risk lives in the
-*deployment* of Phase 3 — daily caps and human review handle it. The tooling
-itself is straightforward jsonl + scheduling.
-
-**Why include in v1:** without campaigns, Cartographer is a navigation cache
-with no user-facing payoff. With campaigns, Cartographer is a tool the user
-can run an outbound campaign on tonight. The campaigns package is the
-delta between "neat infrastructure" and "real product."
-
-**Generalization beyond outbound:**
-- Lead enrichment (visit company pages, extract employees, push to CRM)
-- Competitive intel (weekly product page scrapes, change reports)
-- Content research (hashtag walks, trending post lists)
-- Recruiting outreach (candidate profile review, drafted messages)
-- All share the build/review/send shape; campaigns serves them all.
-
-## Canonical Use Case (anchors design conversations)
-
-To anchor design discussions, the user's stated business workflow is:
-
-> A marketing-agency outbound pipeline targeting fitness creators on Instagram
-> (and eventually LinkedIn) who are below 50K followers and offering 1:1
-> coaching services. The agent qualifies each prospect by reading pinned
-> posts + 15 recent posts, drafts a personalized DM referencing specific
-> content, queues to a list for human review, then sends approved DMs at
-> 5–10/day with randomized delays.
-
-Pipeline:
-1. **Discover candidates** via hashtag/explore walks (Phase 1, full speed)
-2. **Per candidate**: view profile, check_pinned_posts, list_recent_posts,
-   LLM reasons "is this a fit?"
-3. **For each fit**: LLM drafts personalized DM, append to `prospects.jsonl`
-4. **Human reviews** the list, approves selections (Phase 2)
-5. **Paced sender** emits ≤10 DMs/day with 30–90m randomized delays (Phase 3)
-
-This generalizes beyond IG to LinkedIn, Twitter/X, Reddit, custom CRMs,
-recruiting platforms, content research workflows — same shape, different
-indexed graph.
-
-**Optimization metric** (per-prospect cost):
-- Without Cartographer + campaigns: ~5 LLM calls × $0.10 + ~3 min navigation
-  = $0.50 / prospect
-- With: ~2 LLM calls (analysis + DM gen) × $0.10 + ~45s cached navigation
-  = $0.20 / prospect
-- **4× faster, 2.5× cheaper** at 100/day. Bigger gains as N scales (cache
-  amortizes; LLM cost stays per-prospect).
-
-This is the workflow Cartographer is designed to optimize end-to-end. Every
-architectural decision — structural cache key, named processes, hand-curated
-process names, paced send caps — feeds back to making this workflow faster,
-safer, and more leveraged.
-
-## What NOT to Do
-
-- ❌ Reimplement Stagehand's atom extractor / XPath resolver / a11y handling.
-  Use `observe()` and `captureHybridSnapshot`.
-- ❌ Build a new browser harness. V3 already abstracts CDP/Playwright/Puppeteer.
-- ❌ Reimplement `takeDeterministicAction`. Wrap Stagehand's.
-- ❌ Build session/auth persistence. Stagehand has it.
-- ❌ Auto-name processes via LLM in v1. Hand-curate via
-  `cartographer name-process --name X --from <state> --to <state>`.
-- ❌ Run Leiden clustering until graph is dense (50+ states). Flat process
-  list for v1.
-- ❌ Build a graph DB. JSON files. Move to SQLite if a graph exceeds ~5k
-  states.
-- ❌ Modify `packages/core/`. All work lives in new packages.
-- ❌ Add semantic process resolution to the cache. The cache stays structural;
-  a Process Resolver above the cache is optional v2 work.
-- ❌ Conflate Phase 1 (discovery, low risk) with Phase 3 (send, high risk).
-  Tune them independently.
-- ❌ Skip the human-review step (Phase 2). Even with great LLM drafts, the
-  review queue is the line between "useful tool" and "spam cannon."
-
-## Spikes to Run Before Committing 6+ Weeks
-
-Two 1-day spikes in week 1. If either fails, revisit the plan before
-continuing.
-
-### Spike 1 — State hash stability across sessions
-
-50-line script:
-
-1. Launch Stagehand, navigate to `instagram.com`, `waitForLoadState("networkidle")`.
-2. Call `observe("find all interactive elements")` → `Action[]`.
-3. Canonicalize names + roles + xpath-shape, hash → `StateId_a`.
-4. Close browser. Wait. Reopen. Same flow → `StateId_b`.
-5. Print `StateId_a === StateId_b`.
-
-**Pass criterion:** identical hashes for the same logged-in home view across
-two sessions. Acceptable to require minor canonicalization to pass (drop
-trailing-time content, handle account-name variants).
-
-**Fail mode:** if hashes differ wildly, atom canonicalization needs more
-work *or* Stagehand's a11y tree is non-deterministic at our resolution. We
-re-scope before continuing.
-
-### Spike 2 — Direct `takeDeterministicAction` call
-
-30-line script:
-
-1. Launch Stagehand on a known page.
-2. Call `observe("find the Sign in button")` → `Action[]`. Save first action.
-3. Reload the page.
-4. Call `actHandler.takeDeterministicAction(savedAction, page, ...)` directly.
-5. Confirm the click happens without an LLM call.
-
-**Pass criterion:** action executes, no LLM token spent.
-
-**Fail mode:** the function isn't accessible outside `ActCache`. Then our
-runtime calls `act(action.description)` instead — slower (LLM-driven on
-miss), but still works. Plan adjusts: runtime always pays LLM cost on
-*first* call per edge (write-back populates cache for subsequent calls).
-
-## Recommended Order
-
-| # | Workstream | Effort | Why this order |
-|---|---|---|---|
-| 0 | Spikes 1 + 2 | 2 days | De-risk before committing. |
-| 1 | A — State Identity | 3–5 days | Foundation. |
-| 2 | B — State-Keyed Cache | 4–6 days | The actual novelty win. |
-| 3 | D — Path Planner + Runtime (narrow) | 2–3 days | Tracer-bullet through the whole pipe with a hand-authored 2-state graph. |
-| 4 | E — CLI Emitter (narrow) | 2–3 days | Continue the tracer: emit one CLI subcommand. |
-| 5 | C — Cartographer Phase 1 | 7–10 days | Replace the hand-authored graph with explored output. |
-| 6 | H — 2D Viewer | 5–7 days | Visualize what you've built. |
-| 7 | G — Drift Signal | 2–3 days | Subscribe to FlowLogger; aggregate. |
-| 8 | F — MCP Emitter | 3–5 days | CLI works first; MCP is shape-variant. |
-| **9** | **I — Campaigns Package** | **5–7 days** | **The user-facing payoff. Without this, Cartographer is plumbing. Validates the whole stack against the canonical use case.** |
-| 10 | C Phase 2/3 — Prompt + LLM Policy | 2–3 weeks | Optional. |
-| 11 | H 3D toggle | 3–5 days | Optional, after 2D is useful. |
-
-**Total minimum-viable v1: ~7–9 weeks** to "indexed IG with working CLI +
-2D viewer + drift detection + campaigns package running a real end-to-end
-prospect pipeline."
-
-A focused 12-hour MVP can deliver workstreams A, B, D narrow, E narrow with
-a hand-authored 2-state graph as a tracer-bullet — proves the architecture.
-Cartographer (C), Viewer (H), Drift (G), MCP (F), Campaigns (I) are
-multi-day to multi-week each beyond that.
-
-## Day 1 Setup (literal commands)
+Generated agent contract files:
+
+```text
+packages/cartographer/skills/instagram.com/SKILL.md
+packages/cartographer/skills/instagram.com/manifest.json
+~/.cartographer/sites/instagram.com/SKILL.md
+~/.cartographer/sites/instagram.com/manifest.json
+```
+
+Generated local CLI:
+
+```text
+~/.cartographer/bin/instagram-com-cli
+```
+
+Current commands in the local catalog:
+
+```text
+open-explore
+open-inbox
+send-message
+send-test-dm
+```
+
+`open-explore` was acquired through a fallback/promotion run. The broader
+delegated Explore search/click-profile test was interrupted before final
+assessment, so only the promoted `open_explore` skill should be treated as
+validated state from that run.
+
+Current lifecycle support:
+
+```text
+begin-task returns taskStartedAt, fallback command, required review command
+fallback save prints scoped end-task-review and promotion-review commands
+generated SKILL.md and manifest.json mark fallback closeout as required
+promotion review emits review-request.json, decision-schema.json, and REVIEW.md
+apply-promotion-decision applies agent reasoning through deterministic code
+```
+
+Logs are enabled by default and written to stderr so JSON stdout remains
+parseable. Use `CARTOGRAPHER_LOG=0` to silence logs and
+`CARTOGRAPHER_LOG_LEVEL=debug` for selector/action-level detail.
+
+Useful commands:
 
 ```bash
-git clone https://github.com/varadfromeast/stagehand.git
-cd stagehand
-git remote add upstream https://github.com/browserbase/stagehand.git
-git fetch upstream
-
-pnpm install
-pnpm --filter @browserbasehq/stagehand build
-
-# create the cartographer skeleton
-mkdir -p packages/cartographer/src
-cd packages/cartographer
-pnpm init  # name: @cartographer/core; private: true
-# add @browserbasehq/stagehand as a workspace dep
+pnpm --filter @cartographer/core typecheck
+pnpm --filter @cartographer/core build
+node packages/cartographer/dist/cli.js begin-task instagram.com --intent "task description"
+node packages/cartographer/dist/cli.js expose-skills instagram.com
+node packages/cartographer/dist/cli.js review-fallbacks instagram.com
+node packages/cartographer/dist/cli.js create-promotion-review instagram.com <fallback-id>
+node packages/cartographer/dist/cli.js apply-promotion-decision instagram.com --decision-file <decision.json>
 ```
 
-Push the skeleton, run Spike 1 the same day.
+## Agent Contract
 
-## Naming
+The generated `SKILL.md` is the human-readable operating contract. The generated
+`manifest.json` is the machine-readable command contract.
 
-Project: **Cartographer** (or **stagehand-cartographer** for the package
-name). Reasons:
-- Mirrors the existing `SITE_CARTOGRAPHER_PLAN.md` framing
-- Signals "extension to Stagehand," not competitor
-- Maps cleanly to GitNexus's "graph index" but for sites, not code
+The contract tells the agent:
 
-The CLI binary, when emitted, is named per site:
-`~/.cartographer/bin/<domain>-cli`.
+- what commands exist
+- which commands write to Instagram
+- what arguments each command accepts
+- what outputs each command declares
+- what final postconditions decide command success
+- how to interpret `success`, `execution`, `postconditions`, `drift`, and
+  `failure`
+- how to enter fallback recording
+- how to review and promote fallback tapes so the CLI acquires skills
+- that fallback-created learning debt must be closed before the task is
+  considered complete
 
-The campaigns package is named **stagehand-cartographer-campaigns** (or
-`@cartographer/campaigns`). Platform-agnostic — works on top of any
-indexed site.
+There is no hidden natural-language router in V1. The external agent decides
+whether a listed command directly fits the user task.
 
-Campaign artifacts live under `~/.cartographer/campaigns/<campaign-name>/`.
+## Success Model
 
-## What Was Built (so far in this fork)
+Old behavior treated hash drift as command failure. That was too strict for
+dynamic sites like Instagram.
 
-- ✅ Fork created at `varadfromeast/stagehand`, default branch `main`
-- ✅ `agent-handoff.md` v2 (this file) committed — adds Workstream I
-  (campaigns), cache semantics clarification, canonical use case anchor
-- ✅ `UBIQUITOUS_LANGUAGE.md` v2 committed — adds campaigns vocabulary,
-  cache clarification
-- ⏳ Spikes 1 + 2 not yet run
-- ⏳ No `packages/cartographer/` skeleton yet
-- ⏳ No code
+Current behavior:
 
-## References
+```text
+success = no action failures && final postconditions passed
+```
 
-- Upstream: https://github.com/browserbase/stagehand
-- Fork: https://github.com/varadfromeast/stagehand
-- siteforge (abandoned): https://github.com/varadfromeast/siteforge
-- Stagehand caching docs: https://docs.stagehand.dev/v3/best-practices/caching
-- Stagehand cua-replay example: `packages/core/examples/cua-replay.ts`
-- GitNexus (the inspiration for the graph + emitter pattern):
-  https://github.com/abhigyanpatwari/GitNexus
+Hash drift is diagnostic only. A command can return `success:true` with
+`drift.detected:true` if final postconditions passed.
+
+Supported postconditions reuse `StepValidator`:
+
+```ts
+{ type: "url_equals"; value: string }
+{ type: "url_contains"; value: string }
+{ type: "selector_exists"; selector: string }
+{ type: "text_contains"; selector: string; value: string }
+```
+
+Example result shape:
+
+```json
+{
+  "success": true,
+  "processName": "open_inbox",
+  "execution": {
+    "completed": true,
+    "stepCount": 2,
+    "executedStepCount": 2,
+    "actionFailures": []
+  },
+  "postconditions": {
+    "required": true,
+    "passed": true,
+    "checks": [
+      {
+        "type": "url_contains",
+        "passed": true,
+        "expected": "/direct/inbox",
+        "observed": "https://www.instagram.com/direct/inbox/"
+      }
+    ]
+  },
+  "drift": {
+    "detected": false,
+    "severity": "none",
+    "steps": []
+  },
+  "outputs": {},
+  "message": "Replayed 2 step(s); postconditions passed."
+}
+```
+
+## Happy Path
+
+### 1. Agent Reads The Contract
+
+Start from:
+
+```text
+packages/cartographer/skills/instagram.com/SKILL.md
+packages/cartographer/skills/instagram.com/manifest.json
+```
+
+For substantial or unfamiliar tasks, create a task envelope:
+
+```bash
+node packages/cartographer/dist/cli.js begin-task instagram.com --intent "task description"
+```
+
+Keep the returned `taskStartedAt`. If fallback is used, close the task with the
+returned `requiredReviewCommand`.
+
+The agent should choose a listed command only when it directly fits. If no
+listed command fits, use fallback recording.
+
+### 2. Agent Runs A Known CLI Skill
+
+If the task matches an available command:
+
+```bash
+~/.cartographer/bin/instagram-com-cli <command> [args]
+```
+
+For write commands:
+
+```bash
+--confirm-write
+```
+
+For read commands, consume declared values under `outputs` when present.
+Navigation-only commands can have no outputs but must still have deterministic
+postconditions.
+
+### 3. Runtime Replays And Validates
+
+Runtime path:
+
+```text
+NodeCliEmitter output
+  -> createPreloadedRuntime(domain)
+  -> SkillRegistry.preload(domain)
+  -> ProcessTapeRuntime.runProcess()
+  -> SkillRegistry.getProcess()
+  -> BrowserSessionFactory.launchInstagram()
+  -> BrowserSession.actRaw(Action) or BrowserSession.goto(url)
+  -> StateIdentity.capture()
+  -> ReplayValidator.validate(step.validators) for drift diagnostics
+  -> ReplayValidator.validate(process.postconditions) for final success
+  -> read declared ProcessOutput selectors
+  -> JSON result
+```
+
+Important interfaces:
+
+- `ProcessTape`: recorded command, args, steps, outputs, postconditions, write
+  flag.
+- `SkillRegistry`: preloads the site catalog and process tapes for command
+  lookup.
+- `TapeStore`: persists process tapes behind the registry.
+- `BrowserSessionFactory`: opens the browser.
+- `BrowserSession`: abstracts Stagehand/browser actions.
+- `StateActionCache`: stores structural action cache entries by state/atom.
+- `StateIdentity`: captures and normalizes state fingerprints.
+- `ReplayValidator`: validates step expectations and final postconditions.
+- `CartographerLogger`: emits live-run diagnostics to stderr.
+- `CartographerRuntime`: narrow interface exposed to emitted CLIs.
+
+### 4. Agent Uses Fallback When No Skill Fits
+
+If no command directly fits:
+
+```bash
+node packages/cartographer/dist/cli.js fallback instagram.com --intent "task description"
+```
+
+This opens a local Chrome session and starts a deterministic fallback prompt:
+
+```text
+goto <url>
+goto-inbox
+click <selector>
+fill <selector> <value>
+fill-arg <selector> <arg-name> <value>
+text [selector]
+screenshot <label>
+record-step <step-name> [--write]
+save-fallback [--write] [--arg message]
+quit
+```
+
+Fallback creates a `FallbackTape` with deterministic session facts:
+
+- `sessionId` and `recordingStartedAt`
+- replayable `TapeStep[]`
+- an operation log covering `goto`, `click`, `fill`, `text`, `screenshot`,
+  and `record_step`
+- screenshots/text evidence captured explicitly during the fallback
+- selectors, selector diagnostics, arguments, validators, and write flags
+
+Only `record-step` entries become replayable command steps. Earlier operations
+are review context. This keeps capture deterministic while still giving the
+reviewing agent enough session history to decide whether promotion is justified.
+
+Use `fill-arg` when a real value should become a future CLI argument. It types
+the real value into the browser but stores `%argName%` in the tape.
+
+After `save-fallback`, the prompt prints a scoped review command. Running that
+review is mandatory if fallback was used.
+
+Current fallback implementation is Playwright-based because V1 does not assume
+external API keys. `FallbackEngine` remains the future boundary for choosing an
+optional Stagehand fallback in API-key environments, but local Playwright
+fallback is the product default.
+
+### 5. Agent Reviews The Fallback
+
+After the user task is complete:
+
+```bash
+node packages/cartographer/dist/cli.js end-task-review instagram.com --since "<taskStartedAt>"
+```
+
+Scope review to a task start time when useful:
+
+```bash
+node packages/cartographer/dist/cli.js end-task-review instagram.com --since "2026-05-02T10:00:00.000Z"
+```
+
+Lower-level inspection:
+
+```bash
+node packages/cartographer/dist/cli.js review-fallbacks instagram.com
+node packages/cartographer/dist/cli.js inspect-fallback instagram.com <fallback-id>
+```
+
+Review produces a compact packet and `REVIEW.md` with intent, steps, selectors,
+validators, deterministic summary, operation log, evidence previews, and
+promote/reject/apply-decision commands.
+
+### 6. Agent Promotes Or Rejects
+
+Normal workflow uses typed promotion decisions. Create the review artifacts:
+
+```bash
+node packages/cartographer/dist/cli.js create-promotion-review instagram.com <fallback-id>
+```
+
+The agent reads `review-request.json`, `decision-schema.json`, and `REVIEW.md`,
+or starts from `decision-template.json`, then returns one flat
+`PromotionDecision` JSON:
+
+```json
+{
+  "action": "promote",
+  "fallbackTapeId": "<fallback-id>",
+  "reasoning": "Reusable navigation with stable final URL.",
+  "confidence": "medium",
+  "commandName": "open_example",
+  "description": "open example page",
+  "postconditions": [{ "type": "url_contains", "value": "/example" }]
+}
+```
+
+Apply that decision through deterministic code:
+
+```bash
+node packages/cartographer/dist/cli.js apply-promotion-decision instagram.com --decision-file <decision.json>
+```
+
+Manual promotion remains available as an escape hatch:
+
+```bash
+node packages/cartographer/dist/cli.js promote-fallback instagram.com <fallback-id> \
+  --command-name <snake_case> \
+  --description "what this command actually does" \
+  --postcondition url_contains:/path \
+  --output visibleText:body:"visible text returned after replay"
+```
+
+`--output` is optional. Read skills should declare outputs when the task needs
+data extraction.
+
+`--postcondition` is optional only when the fallback already has useful final
+validators. Promoted commands should have deterministic postconditions whenever
+possible.
+
+Reject or delete non-reusable fallbacks:
+
+```bash
+node packages/cartographer/dist/cli.js reject-fallback instagram.com <fallback-id> --reason "too specific"
+node packages/cartographer/dist/cli.js delete-fallback instagram.com <fallback-id>
+```
+
+Promotion writes a new `ProcessTape`, regenerates the CLI, regenerates
+`SKILL.md`, regenerates `manifest.json`, and marks the fallback as promoted.
+`PromotionPolicy` gates the mutation before any process is written.
+The apply result includes a top-level `agentContractDelta`, plus
+`cliCommandName` and `reusableCommand.command`. A long-running agent should
+treat `agentContractDelta` as an immediate patch to its working command list and
+use that command for future matching tasks instead of falling back again.
+The regenerated CLI also supports `instagram-com-cli --help` and
+`instagram-com-cli <command> --help` with descriptions, args, outputs,
+postconditions, and write flags.
+
+## Current Interfaces
+
+Core contracts live in:
+
+```text
+packages/cartographer/src/contracts.ts
+```
+
+Main interfaces:
+
+- `CartographerRuntime`: run a named process.
+- `RunProcessResult`: structured command result with execution,
+  postconditions, drift, failure, outputs, and message.
+- `ProcessTape`: persisted command contract.
+- `Postcondition`: final success criteria, currently an alias of
+  `StepValidator`.
+- `FallbackOperation`: deterministic event recorded during fallback capture.
+- `FallbackPromotionSummary`: deterministic review summary created from a
+  fallback tape and evidence previews.
+- `PromotionDecision`: typed agent reasoning output for promote/reject/delete.
+- `PromotionDecisionApplier`: validates and applies the typed decision.
+- `PromotionPolicy`: deterministic promotion gate.
+- `Learning Debt`: obligation created by fallback use; closed by promotion,
+  rejection, or deletion after review.
+- `SkillRegistry`: preload and serve a site's process catalog in memory.
+- `TapeStore`: load/save process tapes and catalogs.
+- `BrowserSessionFactory`: create browser sessions.
+- `BrowserSession`: navigate, act, read, screenshot, validate selectors.
+- `StateIdentity`: capture a normalized state fingerprint.
+- `StateActionCache`: structural state/atom action cache.
+- `ReplayValidator`: validate URLs, selectors, and text.
+- `BrowserFallbackRecorder`: record fallback browser operations.
+- `FallbackEngine`: future boundary for Stagehand vs Playwright fallback.
+- `ElementLocatorStrategy`: generate replay selectors.
+- `SelectorPolicy`: pick the best selector candidate.
+- `EvidenceStore`: write screenshots/text evidence.
+- `FallbackTapeStore`: save, reject, delete, and mark fallback tapes.
+- `FallbackReviewer`: produce review packets.
+- `SkillPromoter`: turn reviewed fallback tapes into process tapes.
+- `EndOfTaskReviewer`: run post-task fallback review and apply explicit
+  decisions.
+- `CliEmitter`: emit the per-site CLI.
+- `emitSkillMd` and `emitSkillManifest`: emit agent contracts.
+
+## Stagehand Boundary
+
+Known skills store and replay Stagehand-shaped `Action[]`.
+`BrowserSession.actRaw(action)` delegates to Stagehand `act(Action)`.
+
+Stagehand cache is instruction-based. Cartographer cache is structural:
+
+```text
+(state_id, atom_id) -> Action[]
+```
+
+Raw Playwright fallback does not populate Stagehand's own cache. It records
+Cartographer fallback tapes. Promotion turns those tapes into deterministic
+Cartographer skills. Stagehand remains hidden behind `BrowserSession` for known
+skill replay, while default fallback capture stays local and API-key-free.
+
+## Verification Commands
+
+```bash
+pnpm --filter @cartographer/core typecheck
+pnpm --filter @cartographer/core build
+node packages/cartographer/dist/cli.js expose-skills instagram.com
+~/.cartographer/bin/instagram-com-cli open-inbox --dry-run
+```
+
+Live read-only smoke:
+
+```bash
+CARTOGRAPHER_LOG_LEVEL=debug ~/.cartographer/bin/instagram-com-cli open-inbox
+```
+
+Recent smoke result:
+
+```text
+success:true
+postconditions.required:true
+postconditions.passed:true
+drift.detected:false
+```
+
+## Current Gaps
+
+- Browser lifecycle is still process-bound. The CLI closes Chrome after each
+  run. A `--close-browser` or long-lived session model is still pending.
+- Task envelopes are currently lightweight JSON responses, not persisted task
+  records.
+- `open-inbox` and `open-explore` are navigation-only. They have deterministic
+  URL postconditions but no read outputs.
+- Selector generation is deterministic but young.
+- Existing old fallback tapes may not have operation logs or selector
+  diagnostics. New Playwright fallback tapes do.
+- Text evidence is explicit. If the operator does not run `text`, review will
+  flag `no_text_evidence`.
+- `FallbackEngine` exists as an interface, but only local Playwright fallback is
+  implemented today. Stagehand fallback should stay optional because it needs
+  external model/API configuration.
+- There is no MCP emitter yet.
+- There is no visual sitemap/graph viewer yet.
+
+## What Not To Do
+
+- Do not add hidden intent routing or fuzzy command matching inside
+  Cartographer V1.
+- Do not treat hash drift as command failure when final postconditions pass.
+- Do not silently promote fallback tapes.
+- Do not infer read outputs magically from evidence. Promotion should declare
+  outputs explicitly with `--output`.
+- Do not modify `packages/core/` unless there is a specific Stagehand
+  integration reason.
+- Do not treat write actions as normal reads. Writes require `--confirm-write`.
 
 ## Caution
 
-- Cartographer drives a real browser against real sites. **Do not run
-  cartographer's exploration phase against accounts you can't afford to
-  lose.** Use throwaway accounts for any aggressive exploration. The safety
-  gate is the first line of defense, not the last.
-- Anti-bot detection is real. Throttle (min 1s, jitter to 3s). Use existing
-  user sessions instead of fresh logins where possible.
-- **Phase 3 (sending) is the only high-risk phase** of the campaigns
-  workflow. Phase 1 (discovery) and Phase 2 (review) carry minimal platform
-  risk. Tune their pacing independently — full speed on Phase 1, hard caps
-  on Phase 3.
-- Bulk DM workflows on Instagram violate ToS in many cases. The tool is
-  platform-neutral; use it where outbound is legitimate (LinkedIn Sales
-  Navigator workflows, recruiting on opt-in platforms, your own CRM lists).
-  We are not the layer that makes a non-compliant campaign compliant.
-- We are using a fork. Upstream Stagehand changes fast. Pull weekly:
-  `git fetch upstream && git rebase upstream/main` (or merge if rebase
-  conflicts get hairy).
+Cartographer drives a real browser against real accounts. Treat writes as
+high-risk. Keep fallback/promotion explicit, keep write confirmation mandatory,
+and prefer read-only skills until the command contract is clear.

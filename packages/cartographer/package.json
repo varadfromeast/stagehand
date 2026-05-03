@@ -1,0 +1,27 @@
+{
+  "name": "@cartographer/core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Process tape recorder and CLI emitter for Stagehand-driven site automation.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "cartographer": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "cd ../.. && prettier --check packages/cartographer && cd packages/cartographer && pnpm run typecheck"
+  },
+  "dependencies": {
+    "@browserbasehq/stagehand": "workspace:*",
+    "playwright": "^1.52.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "tsx": "^4.19.4",
+    "typescript": "5.8.3"
+  }
+}
