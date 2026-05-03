@@ -4,7 +4,6 @@ import type {
   ProcessArg,
   ProcessTape,
   State,
-  StateActionCache,
   StateIdentity,
   TapeStep,
   TapeStore,
@@ -25,7 +24,6 @@ export async function recordScriptedInstagramDm(
   session: BrowserSession,
   identity: StateIdentity,
   tapeStore: TapeStore,
-  actionCache: StateActionCache,
   options: ScriptedInstagramDmOptions,
 ): Promise<ProcessTape> {
   if (!options.confirmWrite) {
@@ -44,7 +42,7 @@ export async function recordScriptedInstagramDm(
     await delay(2500);
     maybePush(
       steps,
-      await runStep(session, identity, actionCache, {
+      await runStep(session, identity, {
         name: "fill_username",
         instruction: "fill Instagram username",
         action: {
@@ -60,7 +58,7 @@ export async function recordScriptedInstagramDm(
     );
     maybePush(
       steps,
-      await runStep(session, identity, actionCache, {
+      await runStep(session, identity, {
         name: "fill_password",
         instruction: "fill Instagram password",
         action: {
@@ -76,7 +74,7 @@ export async function recordScriptedInstagramDm(
     );
     maybePush(
       steps,
-      await runStep(session, identity, actionCache, {
+      await runStep(session, identity, {
         name: "submit_login",
         instruction: "submit Instagram login",
         action: {
@@ -101,7 +99,7 @@ export async function recordScriptedInstagramDm(
     );
   }
   steps.push(
-    await runStep(session, identity, actionCache, {
+    await runStep(session, identity, {
       name: "open_recipient_profile",
       instruction: `open Instagram profile ${options.recipient}`,
       action: {
@@ -114,7 +112,7 @@ export async function recordScriptedInstagramDm(
     }),
   );
   steps.push(
-    await runStep(session, identity, actionCache, {
+    await runStep(session, identity, {
       name: "open_message_thread",
       instruction: "open profile message thread",
       action: {
@@ -129,7 +127,7 @@ export async function recordScriptedInstagramDm(
   );
   await delay(2000);
   steps.push(
-    await runStep(session, identity, actionCache, {
+    await runStep(session, identity, {
       name: "fill_dm_message",
       instruction: "fill Instagram DM message",
       action: {
@@ -145,7 +143,7 @@ export async function recordScriptedInstagramDm(
   );
   await delay(500);
   steps.push(
-    await runStep(session, identity, actionCache, {
+    await runStep(session, identity, {
       name: "send_dm",
       instruction: "send Instagram DM",
       action: {
@@ -181,7 +179,6 @@ export async function recordScriptedInstagramDm(
 async function runStep(
   session: BrowserSession,
   identity: StateIdentity,
-  actionCache: StateActionCache,
   input: {
     name: string;
     instruction: string;
@@ -222,19 +219,6 @@ async function runStep(
     writesToPlatform: input.writesToPlatform,
     createdAt: now,
   };
-  await actionCache.put({
-    version: 1,
-    domain: session.domain,
-    beforeStateId: before.id,
-    afterStateId: after.id,
-    atomId: atom.id,
-    instruction: input.instruction,
-    actions: step.actions,
-    validationHash: step.validationHash,
-    status: "recorded",
-    writesToPlatform: input.writesToPlatform,
-    updatedAt: now,
-  });
   return step;
 }
 

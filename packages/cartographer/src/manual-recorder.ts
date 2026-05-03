@@ -7,7 +7,6 @@ import type {
   ProcessTape,
   RecordStepOptions,
   State,
-  StateActionCache,
   StateIdentity,
   TapeCatalog,
   TapeStep,
@@ -33,7 +32,6 @@ export class ProcessTapeRecorder implements ManualRecorder {
     private readonly session: BrowserSession,
     private readonly identity: StateIdentity,
     private readonly tapeStore: TapeStore,
-    private readonly actionCache: StateActionCache,
   ) {}
 
   async snapshot(label: string): Promise<State> {
@@ -92,19 +90,6 @@ export class ProcessTapeRecorder implements ManualRecorder {
     };
 
     this.steps.set(step.id, step);
-    await this.actionCache.put({
-      version: 1,
-      domain: before.domain,
-      beforeStateId: before.id,
-      afterStateId: after.id,
-      atomId: step.atomId,
-      instruction: step.instruction,
-      actions: step.actions,
-      validationHash: step.validationHash,
-      status: "recorded",
-      writesToPlatform,
-      updatedAt: now,
-    });
     return step;
   }
 
