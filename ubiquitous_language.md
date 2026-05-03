@@ -43,6 +43,23 @@ agent instructions.
   must run end-of-task review and promote, reject, or delete reviewed fallbacks.
 - **Promotion**: converting a reviewed fallback tape into a process tape, then
   regenerating the CLI, `SKILL.md`, and `manifest.json`.
+- **noLlm Mode**: the operational mode in which Cartographer constructs
+  Stagehand. With `noLlm: true` and `selfHeal: false`, Stagehand initializes
+  without any provider API key, and any LLM-requiring method (`act(string)`,
+  `observe`, `agent`, self-heal) throws if invoked. The runtime hot path —
+  `act(Action)` deterministic replay through `takeDeterministicAction` — is
+  the only sanctioned use of Stagehand during a CLI command. Patched into
+  fork-local Stagehand via `apply-nollm-patch.mjs`.
+- **Stagehand Boundary**: the narrow Stagehand surface Cartographer relies
+  on. Permitted: `init`, `act(Action)`, `page.goto`, `close`, frame/locator
+  resolution, lifecycle waits. Forbidden during runtime: `act(string)`,
+  `observe`, `agent`, self-heal. Policed by `noLlm Mode`.
+- **Apply Script** (`apply-nollm-patch.mjs`): idempotent runner that applies
+  the four-hunk `noLlm` patch to `packages/core/lib/v3/v3.ts` after a fresh
+  pull. Sentinel-protected — re-running detects each hunk and skips. The
+  options.ts and cartographer side of the patch are committed directly; v3.ts
+  ships through this script because the file exceeds single-tool-call
+  payload limits.
 
 ## Boundaries
 
@@ -53,6 +70,14 @@ agent instructions.
 - Agent reasoning controls promotion judgment through `PromotionDecision`.
 - Promotion policy and code control deterministic skill mutation.
 - Review and promotion control organic skill growth.
+- **Cartographer drives the show; Stagehand drives the browser.** Cartographer
+  owns the graph + tape + cache + emitter + workflow layers. Stagehand owns
+  the browser-driver layer (Chrome launch, CDP, Page, Locator, lifecycle
+  waits). The boundary between them is `noLlm Mode`.
+- **Runtime hot path requires no API key.** `act(Action)` replay,
+  `page.goto`, and supporting Stagehand calls work entirely without provider
+  credentials. Any code path that would have required a key throws an
+  explicit error pointing back at `noLlm Mode`.
 
 ## Rules
 
@@ -64,3 +89,12 @@ agent instructions.
   fallback must work locally without external API keys.
 - Do not promote writes without clear write flags and `--confirm-write` runtime
   enforcement.
+- Do not invoke Stagehand's `act(string)`, `observe`, or `agent` from runtime
+  code paths. They will throw under `noLlm Mode`. Use `act(Action)` for
+  deterministic replay; use raw Playwright for fallback recording.
+- Do not require an `OPENAI_API_KEY` (or any provider key) to run a Cartographer
+  CLI command. The runtime is local-first by default.
+- Do not use `pnpm build` or `pnpm typecheck` from repo root — they recurse
+  into upstream `@browserbasehq/stagehand-server-v4` whose SEA build is
+  broken on Node 25. Use `pnpm --filter @cartographer/core...` and
+  `pnpm --filter @browserbasehq/stagehand` instead.
