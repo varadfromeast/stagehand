@@ -26,6 +26,10 @@ export class StagehandBrowserSessionFactory implements BrowserSessionFactory {
       verbose: 1,
       cacheDir: options.cacheDir,
       selfHeal: false,
+      // Cartographer drives Stagehand via deterministic act(Action) replay
+      // and never invokes act(string)/observe()/agent() on the runtime hot
+      // path. noLlm:true skips API key loading entirely.
+      noLlm: true,
       localBrowserLaunchOptions:
         options.browser === "local"
           ? {
