@@ -7,7 +7,6 @@ import { NodeCliEmitter } from "./cli-emitter.js";
 import type { Domain, Postcondition, ProcessArg } from "./contracts.js";
 import { createPreloadedRuntime, parseRuntimeArgs } from "./factory.js";
 import { BasicStateIdentity } from "./state-identity.js";
-import { JsonStateActionCache } from "./state-action-cache.js";
 import { JsonTapeStore } from "./tape-store.js";
 import { ProcessTapeRecorder } from "./manual-recorder.js";
 import { binDir, cartographerHome, tapeDir } from "./paths.js";
@@ -78,7 +77,6 @@ async function main(): Promise<void> {
     await runPlaywrightFallbackPrompt({
       domain,
       intent,
-      actionCache: new JsonStateActionCache(),
       saveFallback: async (tape) => {
         await new JsonFallbackTapeStore().save(tape);
       },
@@ -337,7 +335,6 @@ async function main(): Promise<void> {
         session,
         new BasicStateIdentity(),
         new JsonTapeStore(),
-        new JsonStateActionCache(),
         {
           username,
           password,
@@ -388,7 +385,6 @@ async function teachInstagram(options?: { domain?: Domain; fallbackIntent?: stri
     session,
     new BasicStateIdentity(),
     new JsonTapeStore(),
-    new JsonStateActionCache(),
   );
 
   console.log("Opened Instagram in a Stagehand local Chrome session.");
@@ -713,8 +709,8 @@ async function saveFallbackTape(input: {
     })),
     writesToPlatform: input.writesToPlatform,
     recordingStartedAt: now,
-    createdAt: now,
     completedAt: now,
+    createdAt: now,
   };
   await new JsonFallbackTapeStore().save(tape);
   return tape;
